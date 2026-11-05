@@ -6,7 +6,7 @@ from pathlib import Path
 # Cross-platform: Windows, macOS, Linux
 # ============================================================
 
-# Project root (relative to this script's location)
+# Project root (relative to this script's location) make sure you run this file on the parent folder of your project
 ROOT = Path(__file__).resolve().parent / "mlops-final-project"
 
 # Directories

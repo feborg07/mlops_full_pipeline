@@ -1,0 +1,13 @@
+numpy==2.4.1
+pandas==3.0.0
+scipy==1.17.0
+matplotlib==3.10.7
+seaborn==0.13.2
+scikit-learn==1.8.0
+mlflow==3.17.2
+dvc==3.67.1
+evidently==0.7.23
+pytest==9.1.1
+PyYAML==6.0.3
+jupyterlab==4.6.4
+ipykernel==7.3.0

@@ -61,7 +61,7 @@ desktop.ini
 /data/drift/*
 
 # Preserve folder structure
-!/data/raw/.gitkeep
+# !/data/raw/.gitkeep
 !/data/processed/.gitkeep
 !/data/drift/.gitkeep
 !/data/raw/*.dvc

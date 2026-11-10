@@ -1,0 +1,5 @@
+[core]
+    remote = storage
+['remote "storage"']
+    url = s3://tt-project-17-054886546281-us-east-2-an/dvc-public
+    allow_anonymous_login = true

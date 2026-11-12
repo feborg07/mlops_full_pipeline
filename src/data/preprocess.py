@@ -1,50 +1,83 @@
 """
-Data preprocessing pipeline for the Adult Income classification project.
+Sprint 17 - MLOps Final Project
+Module: src/data/preprocess.py
 
-Responsibilities:
-- Load and validate the raw dataset.
-- Clean missing values and duplicate records.
-- Encode the binary target
-- Split data into training and test sets.
-- Build a reusable scikit-learn preprocessing pipeline.
-- Fit transformations using training data only.
-- Save processed datasets and the fitted preprocessor.
+Purpose
+-------
+Provide a configurable, reproducible preprocessing pipeline for
+the UCI Adult Income dataset.
+
+Architecture
+------------
+1. Load and concatenate raw datasets.
+2. Clean and validate the data.
+3. Encode the binary target.
+4. Split observations into training and testing partitions.
+5. Build a configurable scikit-learn preprocessing transformer.
+6. Fit transformations using training data only.
+7. Save processed datasets and preprocessing artifacts.
+
+EDA-driven options
+------------------
+- Categorical missing-value imputation
+- Rare-category grouping
+- Numerical scaling
+- Capital gain/loss transformations
+- Capital presence indicators
+- Education feature representation
+- Selected feature interactions
+- Duplicate-aware train/test splitting
+
+Important
+---------
+The preprocessor is designed to be embedded inside a scikit-learn
+Pipeline during model cross-validation.
+
+Do not fit a preprocessor on the complete training dataset before
+performing cross-validation. Doing so would allow validation-fold
+information to influence fitted transformations.
+
+Duplicate records are preserved by default.
 """
 
 # ============================================================
-# Imports
+# 1. Imports
 # ============================================================
 
-# Path: Cross-platform file and directory management
-from pathlib import Path
-# Sequence: Type hint for ordered collections of file paths.
+# Standard library
+import json
 from collections.abc import Sequence
-# joblib: Save and load fitted preprocessing objects.
+from dataclasses import asdict, dataclass
+from numbers import Integral, Real
+from pathlib import Path
+
+# Model serialization
 import joblib
-# numpy: Numerical operations and array manipulation.
+
+# Data manipulation
 import numpy as np
-# Load, concatenate, clean, and manipulate datasets
 import pandas as pd
-# ColumnTransformer: Apply difference transformations to numerical and categorical columns.
+
+# Scikit-learn transformers and pipeline tools
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
-# Replace missing values using statistical strategies such as median or most frequent.
 from sklearn.impute import SimpleImputer
-# Chain preprocessing steps into a single object
-from sklearn.pipeline import Pipeline
-# Convert categorical variables into numerical indicator columns
-# Standardize numerical features.
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-# Create reproducible train/test partitions
 from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import (
+    OneHotEncoder,
+    RobustScaler,
+    StandardScaler,
+)
+from sklearn.utils.validation import check_is_fitted
 
 # ============================================================
-# Configuration
+# 2. Global constants
 # ============================================================
 
 RANDOM_STATE = 42
 TEST_SIZE = 0.20
 
-# Column names defined by the Adult Income dataset
 COLUMN_NAMES = [
     "age",
     "workclass",
@@ -85,559 +118,1256 @@ CATEGORICAL_FEATURES = [
     "native-country",
 ]
 
-# Adult Income contains two target classes.
-# adult.test includes a trailing period in the labels.
 TARGET_MAPPING = {
     "<=50K": 0,
-    ">50K": 1
+    ">50K": 1,
 }
 
+FEATURE_COLUMNS = NUMERICAL_FEATURES + CATEGORICAL_FEATURES
+
+CAPITAL_COLUMNS = [
+    "capital-gain",
+    "capital-loss",
+]
+
+
 # ============================================================
-# 1. Load and concatenate datasets
+# 3. Preprocessing configuration
 # ============================================================
 
+
+def _check_choice(name: str, value, choices: tuple[str, ...]) -> None:
+    """
+    Raise ValueError when a setting is not one of its allowed values.
+
+    The error message lists the options in order, for example:
+
+        numerical_scaling must be 'standard', 'robust', or 'none'.
+
+    Parameters
+    ----------
+    name:
+        Name of the configuration field being checked.
+
+    value:
+        Value supplied for that field.
+
+    choices:
+        Allowed values, in the order shown in the error message.
+    """
+
+    if value in choices:
+        return
+
+    quoted = [f"'{choice}'" for choice in choices]
+
+    # Two options read "'a' or 'b'"; three or more read "'a', 'b', or 'c'".
+    if len(quoted) == 2:
+        options = " or ".join(quoted)
+    else:
+        options = ", ".join(quoted[:-1]) + ", or " + quoted[-1]
+
+    raise ValueError(f"{name} must be {options}.")
+
+
+@dataclass(frozen=True)
+class PreprocessingConfig:
+    """
+    Configuration controlling the preprocessing workflow.
+
+    Each configuration can be used as a separate MLflow
+    experiment during model development.
+
+    Parameters
+    ----------
+    categorical_imputation:
+        "constant" or "most_frequent".
+
+    missing_category:
+        Label used when categorical_imputation="constant".
+
+    rare_category_frequency:
+        Minimum frequency required for a category to remain
+        separate in OneHotEncoder.
+
+        None disables infrequent-category grouping.
+
+        A float between 0 and 1 represents a proportion of
+        the fitting dataset.
+
+    numerical_imputation:
+        Numerical missing-value strategy.
+
+    numerical_scaling:
+        "standard", "robust", or "none".
+
+    capital_transform:
+        "original", "log1p", or "both".
+
+    capital_indicators:
+        Add binary features indicating positive capital
+        gain and capital loss.
+
+    education_representation:
+        "education-num", "education", or "both".
+
+    interaction_features:
+        Add selected EDA-motivated interaction features.
+
+    duplicate_aware_split:
+        Keep identical predictor vectors in the same partition
+        without deleting observations.
+
+    test_size:
+        Proportion reserved for final testing.
+
+    random_state:
+        Random seed used for reproducibility.
+    """
+
+    categorical_imputation: str = "constant"
+    missing_category: str = "Unknown"
+
+    rare_category_frequency: float | None = 0.01
+
+    numerical_imputation: str = "median"
+    numerical_scaling: str = "standard"
+
+    capital_transform: str = "log1p"
+    capital_indicators: bool = True
+
+    education_representation: str = "education-num"
+
+    interaction_features: bool = False
+
+    duplicate_aware_split: bool = True
+
+    test_size: float = TEST_SIZE
+    random_state: int = RANDOM_STATE
+
+    def __post_init__(self):
+        """
+        Validate configuration immediately after creation.
+        """
+
+        _check_choice(
+            "categorical_imputation",
+            self.categorical_imputation,
+            ("constant", "most_frequent"),
+        )
+
+        if (
+            not isinstance(self.missing_category, str)
+            or not self.missing_category.strip()
+        ):
+            raise ValueError("missing_category must be a nonempty string.")
+
+        frequency = self.rare_category_frequency
+
+        if frequency is not None and (
+            not isinstance(frequency, Real)
+            or isinstance(frequency, bool)
+            or not 0 < frequency < 1
+        ):
+            raise ValueError(
+                "rare_category_frequency must be None or a number between 0 and 1."
+            )
+
+        _check_choice(
+            "numerical_imputation",
+            self.numerical_imputation,
+            ("median", "mean"),
+        )
+        _check_choice(
+            "numerical_scaling",
+            self.numerical_scaling,
+            ("standard", "robust", "none"),
+        )
+        _check_choice(
+            "capital_transform",
+            self.capital_transform,
+            ("original", "log1p", "both"),
+        )
+        _check_choice(
+            "education_representation",
+            self.education_representation,
+            ("education-num", "education", "both"),
+        )
+
+        if (
+            isinstance(self.test_size, bool)
+            or not isinstance(self.test_size, Real)
+            or not 0 < self.test_size < 1
+        ):
+            raise ValueError("test_size must be between 0 and 1.")
+
+        if (
+            isinstance(self.random_state, bool)
+            or not isinstance(self.random_state, Integral)
+            or not 0 <= self.random_state <= 2**32 - 1
+        ):
+            raise ValueError(
+                "random_state must be an integer between 0 and "
+                "2**32 - 1, excluding bool."
+            )
+
+        # Normalize NumPy scalar values for JSON serialization.
+        object.__setattr__(self, "random_state", int(self.random_state))
+        object.__setattr__(self, "test_size", float(self.test_size))
+        if frequency is not None:
+            object.__setattr__(self, "rare_category_frequency", float(frequency))
+
+
+# ============================================================
+# 4. Load and concatenate raw datasets
+# ============================================================
+
+
 def load_and_concatenate_data(
-        paths: Sequence[str | Path]
+    paths: Sequence[str | Path],
 ) -> pd.DataFrame:
     """
     Load multiple Adult Income files and concatenate them.
 
-    Parameters
-    ----------
-    paths : Sequence[str | Path]
-        List of file paths to load.
-
-        Example:
-        [
-            "data/raw/adult.data",
-            "data/raw/adult.test"
-        ]
+    Handles:
+    - adult.data
+    - adult.test
+    - The metadata line beginning with "|" in adult.test
+    - Missing values represented by "?"
+    - Source-file tracking
 
     Returns
     -------
     pd.DataFrame
-        Concatenated dataset containing all valid records.
-
-    Notes
-    -----
-    - Files are concatenated vertically.
-    - Original column names are assigned automatically
-    - The header line in adult.test is ignored (see example)
-    - Missing values represented by '?' are converted to NaN.
-    - Original row indices are reset.
+        Combined dataset containing all observations.
     """
 
-    # Check parameter
     if not paths:
-        raise ValueError("The paths list cannot be empty")
+        raise ValueError("The paths list cannot be empty.")
 
-    datasets = []
+    dataframes = []
 
     for path in paths:
+        path = Path(path)
 
-        # Convert the supplied path to a Path object.
-        file_path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Dataset not found: {path}")
 
-        # Verify file exists.
-        if not file_path.is_file():
-            raise FileNotFoundError(f"Dataset file not found: {file_path}")
-
-        # Read the file using the Adult Income schema.
-        # comment='|' ignores the metadata header in adult.test.
-        # skipinitialspace removes whitespace after delimiters.
         df = pd.read_csv(
-            file_path,
+            path,
             header=None,
             names=COLUMN_NAMES,
             sep=",",
             skipinitialspace=True,
             na_values=["?", ""],
-            comment="|"
+            comment="|",
         )
 
-        # Remove rows that contain no meaningful data.
+        # Remove completely empty records.
         df = df.dropna(how="all")
 
-        # Preserve the source filename for traceability
-        # This column will be removed before model training.
-        df["source_file"] = file_path.name
+        # Preserve the origin of each observation.
+        df["source_file"] = path.name
 
-        datasets.append(df)
+        dataframes.append(df)
 
-    # Combine datasets vertically into one DataFrame.
-    combine_df = pd.concat(
-        datasets,
-        axis=0,
+    combined_df = pd.concat(
+        dataframes,
         ignore_index=True,
     )
 
-    return combine_df
+    return combined_df
+
 
 # ============================================================
-# 2. Clean dataset
+# 5. Clean dataset
 # ============================================================
+
 
 def clean_data(
-        df: pd.DataFrame,
-        remove_duplicates: bool = False,
+    df: pd.DataFrame,
+    remove_duplicates: bool = False,
 ) -> pd.DataFrame:
     """
-    Clean the combined Adult Income dataset.
+    Apply deterministic cleaning operations.
 
-    Parameters
+    Operations
     ----------
-    df : pd.DataFrame
-        Raw concatenated dataset.
+    1. Copy the input DataFrame.
+    2. Remove surrounding whitespace.
+    3. Normalize missing-value markers.
+    4. Remove trailing periods from target labels.
+    5. Convert numerical columns.
+    6. Remove records without a valid target value.
+    7. Optionally remove duplicate observations.
 
-    remove_duplicates : bool, default=False
-        Whether to remove exact duplicate records.
-
-    Returns
-    -------
-    pd.DataFrame
-        Cleaned dataset.
+    Duplicate records are preserved by default.
     """
 
-    cleaned_df = df.copy()
+    cleaned = df.copy(deep=True)
 
-    # Remove leading and trailing whitespace from string columns without converting NaN strings.
-    string_columns = cleaned_df.select_dtypes(
-        include=["object", "string", "category"]
-    ).columns
+    # Normalize string columns.
+    for column in cleaned.select_dtypes(include=["object", "string"]).columns:
+        cleaned[column] = cleaned[column].map(
+            lambda value: value.strip() if isinstance(value, str) else value
+        )
 
-    for column in string_columns:
-        cleaned_df[column] = cleaned_df[column].str.strip()
-
-    # Replace missing-value markers with actual NaN values
-    cleaned_df = cleaned_df.replace(
+    # Normalize textual missing-value markers.
+    cleaned = cleaned.replace(
         ["?", "", "nan"],
         np.nan,
     )
 
-    # Remove the trailing period from target labels.
-    cleaned_df[TARGET_COLUMN] = (
-        cleaned_df[TARGET_COLUMN]
-        .srt.rstrip(".")
-    )
+    # Normalize income labels from adult.test.
+    cleaned[TARGET_COLUMN] = cleaned[TARGET_COLUMN].astype("string").str.rstrip(".")
 
-    # Convert expected numerical columns to numeric types. Invalid values are converted to NaN
+    # Convert all configured numerical features.
     for column in NUMERICAL_FEATURES:
-        cleaned_df[column] = pd.to_numeric(
-            cleaned_df[column],
+        cleaned[column] = pd.to_numeric(
+            cleaned[column],
             errors="coerce",
         )
 
-    # Remove rows without a valid target. Target values should not be imputed
-    cleaned_df = cleaned_df.dropna(
-        subset=[TARGET_COLUMN]
-    )
+    # A supervised observation requires a target label.
+    cleaned = cleaned.dropna(subset=[TARGET_COLUMN])
 
-    # Optionally remove exact duplicates.
-    # Exclude source_file from the duplicate comparison
+    # Optional duplicate removal.
+    # Source-file metadata must not define uniqueness.
     if remove_duplicates:
-
-        comparison_columns = [
-            column
-            for column in COLUMN_NAMES
-            if column in cleaned_df.columns
-        ]
-
-        cleaned_df = cleaned_df.drop_duplicates(
-            subset=comparison_columns,
-            keep="first"
+        cleaned = cleaned.drop_duplicates(
+            subset=COLUMN_NAMES,
         )
 
-    return cleaned_df.reset_index(drop=True)
+    return cleaned.reset_index(drop=True)
+
 
 # ============================================================
-# 3. Validate dataset
+# 6. Validate dataset
 # ============================================================
 
-def validate_data(df: pd.DataFrame) -> None:
-    """
-    Validate the dataset before preprocessing.
 
-    Raises
-    ------
-    ValueError
-        If required columns are missing or target values are invalid
+def validate_data(
+    df: pd.DataFrame,
+) -> None:
+    """
+    Validate the dataset before modeling.
+
+    Checks:
+    - Required columns exist.
+    - Dataset is not empty.
+    - Target contains only supported labels.
+    - Both target classes are represented.
     """
 
-    # Verify that all expected columns exist.
     missing_columns = set(COLUMN_NAMES) - set(df.columns)
 
     if missing_columns:
-        raise ValueError(
-            f"Missing required columns: {sorted(missing_columns)}"
-        )
+        raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
 
-    # Verify that target labels are valid.
-    invalid_targets = set(
-        df[TARGET_COLUMN].dropna().unique()
-    ) - set(TARGET_MAPPING.keys())
-
-    if invalid_targets:
-        raise ValueError(
-            f"Unexpected target labels: {invalid_targets}"
-        )
-
-    # Verify that the dataset is not empty
     if df.empty:
-        raise ValueError(
-            "The dataset contains no valid records."
-        )
+        raise ValueError("The dataset is empty.")
 
-    # Verify that both target classes are represented.
-    if df[TARGET_COLUMN].nunique() != 2:
-        raise ValueError(
-            "The dataset must contain both income classes"
-        )
+    target_values = set(df[TARGET_COLUMN].dropna().unique())
+
+    invalid_labels = target_values - set(TARGET_MAPPING)
+
+    if invalid_labels:
+        raise ValueError(f"Unexpected target labels: {sorted(invalid_labels)}")
+
+    if target_values != set(TARGET_MAPPING):
+        raise ValueError("The dataset must contain both income classes.")
+
+    if df[TARGET_COLUMN].isna().any():
+        raise ValueError("The target column contains missing values.")
+
 
 # ============================================================
-# 4. Encode target variable
+# 7. Encode binary target
 # ============================================================
 
-def encode_target(df: pd.DataFrame) -> pd.DataFrame:
+
+def encode_target(
+    df: pd.DataFrame,
+) -> pd.DataFrame:
     """
-    Encode the income target as a binary variable.
+    Encode income as a binary numerical target.
 
     <=50K -> 0
-    <50K  -> 1
+    >50K  -> 1
     """
 
-    encoded_df = df.copy()
+    encoded = df.copy(deep=True)
 
-    encoded_df[TARGET_COLUMN] = (
-        encoded_df[TARGET_COLUMN]
-        .map(TARGET_COLUMN)
-        .astype("int64")
-    )
+    if TARGET_COLUMN not in encoded.columns:
+        raise ValueError(f"Missing target column: {TARGET_COLUMN}")
 
-    return encoded_df
+    target = encoded[TARGET_COLUMN]
+    if target.isna().any():
+        raise ValueError("Target contains missing values.")
+
+    invalid = target.loc[~target.isin(TARGET_MAPPING)]
+    if not invalid.empty:
+        raise ValueError(f"Unexpected target labels: {invalid.unique().tolist()}")
+
+    encoded[TARGET_COLUMN] = encoded[TARGET_COLUMN].map(TARGET_MAPPING).astype("int64")
+
+    return encoded
+
 
 # ============================================================
-# 5. Split features and target
+# 8. Separate features and target
 # ============================================================
+
 
 def split_features_target(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.Series]:
     """
-    Separate predictor variables from the target.
+    Separate predictor features and target labels.
 
-    Returns
-    -------
-
-    X : pd.DataFrame
-        Predictor variables
-
-    y : pd.Series
-        Binary target variable
+    The source_file metadata column is excluded from
+    the model input.
     """
 
-    # Explicitly select the model features.
-    # This prevents source_file and other metadata from entering the training pipeline
-    feature_columns = (
-        NUMERICAL_FEATURES + CATEGORICAL_FEATURES
-    )
+    X = df[FEATURE_COLUMNS].copy()
 
-    X = df[feature_columns].copy()
     y = df[TARGET_COLUMN].copy()
 
     return X, y
 
+
 # ============================================================
-# 6. Create train/test split
+# 9. Duplicate-aware train/test splitting
 # ============================================================
 
+
 def create_train_test_split(
-        X: pd.DataFrame,
-        y: pd.Series,
-        test_size: float = TEST_SIZE,
-        random_state: int = RANDOM_STATE,
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float = TEST_SIZE,
+    random_state: int = RANDOM_STATE,
+    duplicate_aware: bool = True,
 ) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
     pd.Series,
-    pd.Series
+    pd.Series,
 ]:
-
     """
-    Create a reproducible stratified train/test split.
+    Split data into training and testing partitions.
 
-    Stratification preserves approximately the same target class proportions in both datasets.
+    When duplicate_aware=True, identical complete feature
+    records are assigned to the same partition.
+
+    Duplicate records are not deleted.
+
+    The split operates on unique feature groups and then
+    expands those groups back into individual observations.
+
+    Limitations
+    -----------
+    Group-level stratification approximates, but does not
+    guarantee, observation-level class proportions.
+
+    Groups are defined using complete predictor values.
+    Identical feature vectors with different target labels
+    are still assigned to the same partition.
     """
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
+    if len(X) != len(y):
+        raise ValueError("X and y must contain the same number of rows.")
+
+    if not X.index.equals(y.index):
+        raise ValueError("X and y must have matching indices.")
+
+    # Reuse the same validation for direct calls and the full workflow.
+    split_config = PreprocessingConfig(
         test_size=test_size,
         random_state=random_state,
-        stratify=y,
     )
+    test_size = split_config.test_size
+    random_state = split_config.random_state
+
+    if not duplicate_aware:
+        return train_test_split(
+            X,
+            y,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=y,
+        )
+
+    # Reset positional indices for reliable group expansion.
+    X_reset = X.reset_index(drop=True)
+    y_reset = y.reset_index(drop=True)
+
+    # Factorize complete feature rows into group IDs.
+    #
+    # Missing values are treated as equivalent within
+    # the grouping operation.
+    group_index = pd.MultiIndex.from_frame(X_reset)
+
+    group_codes, _ = pd.factorize(
+        group_index,
+        sort=False,
+    )
+
+    # Construct a table linking each observation to
+    # its feature-group ID and target label.
+    grouping_df = pd.DataFrame(
+        {
+            "group": group_codes,
+            "target": y_reset.to_numpy(),
+        }
+    )
+
+    # Calculate group sizes and positive-class rates.
+    group_summary = (
+        grouping_df.groupby("group", sort=False)
+        .agg(
+            group_size=("target", "size"),
+            positive_rate=("target", "mean"),
+        )
+        .reset_index()
+    )
+
+    # Assign each group to a class for approximate
+    # group-level stratification.
+    group_summary["stratum"] = (group_summary["positive_rate"] >= 0.5).astype(int)
+
+    # Stratification requires at least two groups
+    # in each stratum.
+    stratum_counts = group_summary["stratum"].value_counts()
+
+    can_stratify = (
+        len(stratum_counts) == 2
+        and stratum_counts.min() >= 2
+        and int(np.ceil(len(group_summary) * test_size)) >= 2
+        and len(group_summary) - int(np.ceil(len(group_summary) * test_size)) >= 2
+    )
+
+    group_train, group_test = train_test_split(
+        group_summary["group"],
+        test_size=test_size,
+        random_state=random_state,
+        stratify=(group_summary["stratum"] if can_stratify else None),
+    )
+
+    # Expand selected groups to original observations.
+    train_mask = grouping_df["group"].isin(group_train).to_numpy()
+
+    test_mask = grouping_df["group"].isin(group_test).to_numpy()
+
+    X_train = X.iloc[np.flatnonzero(train_mask)].copy()
+
+    X_test = X.iloc[np.flatnonzero(test_mask)].copy()
+
+    y_train = y.iloc[np.flatnonzero(train_mask)].copy()
+
+    y_test = y.iloc[np.flatnonzero(test_mask)].copy()
+
+    # Verify that all observations were assigned.
+    if np.any(train_mask & test_mask) or not np.all(train_mask | test_mask):
+        raise RuntimeError("Train/test split lost observations or assigned them twice.")
 
     return X_train, X_test, y_train, y_test
 
+
 # ============================================================
-# 7. Build preprocessing transformer
+# 10. EDA-driven feature engineering
 # ============================================================
 
-def build_preprocessor() -> ColumnTransformer:
+
+class AdultFeatureEngineer(
+    BaseEstimator,
+    TransformerMixin,
+):
     """
-    Create preprocessing pipelines for numerical and categorical features.
+    Create optional EDA-driven features.
 
-    Numerical pipeline:
-        1. Impute missing values using the median.
-        2. Standardize features
+    This transformer is compatible with scikit-learn
+    Pipeline and cross-validation.
 
-    Categorical pipeline:
-        1. Impute missing values using the most frequent category.
-        2. Apply one-hot encoding
-    
-    Returns
-    -------
-    ColumnTransformer
-        Unfitted preprocessing transformer
+    Feature transformations are deterministic and do not
+    learn population statistics.
+
+    Parameters
+    ----------
+    capital_transform:
+        "original", "log1p", or "both".
+
+    capital_indicators:
+        Whether to add positive-capital indicators.
+
+    education_representation:
+        Which education representation to retain.
+
+    interaction_features:
+        Whether to create selected interaction features.
     """
 
-    # Numerical preprocessing pipeline
-    numerical_pipeline = Pipeline(
-        steps=[
-            (
-                "imputer",
-                SimpleImputer(strategy="median"),
-            ),
-            (
-                "scaler",
-                StandardScaler(),
+    def __init__(
+        self,
+        capital_transform="log1p",
+        capital_indicators=True,
+        education_representation="education-num",
+        interaction_features=False,
+    ):
+
+        self.capital_transform = capital_transform
+
+        self.capital_indicators = capital_indicators
+
+        self.education_representation = education_representation
+
+        self.interaction_features = interaction_features
+
+    def fit(self, X, y=None):
+        """
+        Validate input columns and record input schema.
+        """
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("AdultFeatureEngineer requires a DataFrame.")
+
+        missing = set(FEATURE_COLUMNS) - set(X.columns)
+
+        if missing:
+            raise ValueError(f"Missing input features: {sorted(missing)}")
+
+        self.feature_names_in_ = np.asarray(
+            X.columns,
+            dtype=object,
+        )
+
+        self.n_features_in_ = X.shape[1]
+
+        # Derive names from the actual transformation, preserving column order.
+        self.output_features_ = np.asarray(
+            self._transform_frame(X).columns, dtype=object
+        )
+
+        return self
+
+    def get_feature_names_out(self, input_features=None):
+        """Return output names and validate names propagated by Pipeline."""
+        check_is_fitted(self, "output_features_")
+        if input_features is not None and not np.array_equal(
+            np.asarray(input_features, dtype=object), self.feature_names_in_
+        ):
+            raise ValueError("input_features must match feature_names_in_.")
+        return self.output_features_.copy()
+
+    def transform(self, X):
+        """
+        Apply deterministic feature transformations.
+        """
+
+        if not hasattr(self, "feature_names_in_"):
+            raise RuntimeError("AdultFeatureEngineer must be fitted first.")
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("AdultFeatureEngineer requires a DataFrame.")
+
+        missing = set(self.feature_names_in_) - set(X.columns)
+
+        if missing:
+            raise ValueError(f"Missing input features: {sorted(missing)}")
+
+        return self._transform_frame(X)
+
+    def _transform_frame(self, X):
+        """Build a DataFrame without invoking scikit-learn output wrapping."""
+        transformed = X.loc[:, self.feature_names_in_].copy(deep=True)
+
+        # ----------------------------------------------------
+        # Capital gain/loss feature engineering
+        # ----------------------------------------------------
+
+        for column in CAPITAL_COLUMNS:
+            values = pd.to_numeric(
+                transformed[column],
+                errors="coerce",
             )
-        ]
+
+            # Negative capital values are not expected
+            # in the Adult Income dataset.
+            if values.lt(0).any():
+                raise ValueError(f"{column} contains negative values.")
+
+            if self.capital_indicators:
+                transformed[f"{column}-positive"] = (values > 0).astype("int64")
+
+            if self.capital_transform in {
+                "log1p",
+                "both",
+            }:
+                transformed[f"{column}-log1p"] = np.log1p(values)
+
+        # Remove original capital features when only
+        # the logarithmic representation is requested.
+        if self.capital_transform == "log1p":
+            transformed = transformed.drop(columns=CAPITAL_COLUMNS)
+
+        # ----------------------------------------------------
+        # Education representation
+        # ----------------------------------------------------
+
+        if self.education_representation == "education-num":
+            transformed = transformed.drop(columns=["education"])
+
+        elif self.education_representation == "education":
+            transformed = transformed.drop(columns=["education-num"])
+
+        # ----------------------------------------------------
+        # Selected interaction features
+        # ----------------------------------------------------
+
+        if self.interaction_features:
+            # Age × educational attainment.
+            #
+            # education-num is an ordered numerical
+            # representation of education level.
+            transformed["age-education-interaction"] = pd.to_numeric(
+                X["age"],
+                errors="coerce",
+            ) * pd.to_numeric(
+                X["education-num"],
+                errors="coerce",
+            )
+
+        return transformed
+
+
+# ============================================================
+# 11. Custom occupation-hours interaction transformer
+# ============================================================
+
+
+class OccupationHoursTransformer(
+    BaseEstimator,
+    TransformerMixin,
+):
+    """
+    Create occupation-specific working-hours features.
+
+    The transformer learns occupation categories only
+    from the fitting dataset.
+
+    Each category receives an interaction column:
+
+        occupation_indicator * hours_per_week
+
+    Unseen occupations produce zeros across the learned
+    occupation-specific columns.
+    """
+
+    def fit(self, X, y=None):
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("OccupationHoursTransformer requires a DataFrame.")
+
+        missing = {"occupation", "hours-per-week"} - set(X.columns)
+        if missing:
+            raise ValueError(f"Missing input features: {sorted(missing)}")
+
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        self.n_features_in_ = X.shape[1]
+
+        self.occupations_ = sorted(
+            X["occupation"].dropna().astype(str).unique().tolist()
+        )
+
+        self.output_features_ = np.asarray(
+            list(self.feature_names_in_)
+            + [
+                f"occupation-hours-interaction-{index}"
+                for index in range(len(self.occupations_))
+            ],
+            dtype=object,
+        )
+
+        return self
+
+    def get_feature_names_out(self, input_features=None):
+        """Return input names followed by the learned interaction names."""
+        check_is_fitted(self, "output_features_")
+        if input_features is not None and not np.array_equal(
+            np.asarray(input_features, dtype=object), self.feature_names_in_
+        ):
+            raise ValueError("input_features must match feature_names_in_.")
+        return self.output_features_.copy()
+
+    def transform(self, X):
+
+        if not hasattr(self, "occupations_"):
+            raise RuntimeError("OccupationHoursTransformer must be fitted first.")
+
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("OccupationHoursTransformer requires a DataFrame.")
+        missing = set(self.feature_names_in_) - set(X.columns)
+        if missing:
+            raise ValueError(f"Missing input features: {sorted(missing)}")
+
+        transformed = X.loc[:, self.feature_names_in_].copy(deep=True)
+
+        hours = pd.to_numeric(
+            transformed["hours-per-week"],
+            errors="coerce",
+        )
+
+        for index, occupation in enumerate(self.occupations_):
+            column_name = f"occupation-hours-interaction-{index}"
+
+            transformed[column_name] = (
+                transformed["occupation"].eq(occupation).fillna(False).astype("float64")
+                * hours
+            )
+
+        return transformed
+
+
+# ============================================================
+# 12. Determine transformed feature groups
+# ============================================================
+
+
+def get_feature_groups(
+    config: PreprocessingConfig,
+) -> tuple[list[str], list[str]]:
+    """
+    Determine numerical and categorical columns after
+    EDA-driven feature engineering.
+    """
+
+    numerical = NUMERICAL_FEATURES.copy()
+
+    categorical = CATEGORICAL_FEATURES.copy()
+
+    # Education representation.
+    if config.education_representation == "education-num":
+        categorical.remove("education")
+
+    elif config.education_representation == "education":
+        numerical.remove("education-num")
+
+    # Capital representation.
+    if config.capital_transform == "log1p":
+        for column in CAPITAL_COLUMNS:
+            numerical.remove(column)
+
+    if config.capital_transform in {"log1p", "both"}:
+        for column in CAPITAL_COLUMNS:
+            numerical.append(f"{column}-log1p")
+
+    # Binary capital indicators.
+    if config.capital_indicators:
+        for column in CAPITAL_COLUMNS:
+            numerical.append(f"{column}-positive")
+
+    # Interaction features.
+    if config.interaction_features:
+        numerical.append("age-education-interaction")
+
+        # Dynamically select occupation-specific interactions.
+        # These columns are generated during pipeline fitting.
+
+    return numerical, categorical
+
+
+# ============================================================
+# 13. Build configurable preprocessing pipeline
+# ============================================================
+class NumericalFeatureSelector:
+    """
+    Select numerical features, including dynamically
+    generated occupation-hours interactions.
+
+    A top-level class is compatible with joblib serialization.
+    """
+
+    def __init__(self, feature_names, include_interactions=False):
+        self.feature_names = list(feature_names)
+        self.include_interactions = include_interactions
+
+    def __call__(self, X):
+        selected = list(self.feature_names)
+
+        if self.include_interactions:
+            selected.extend(
+                column
+                for column in X.columns
+                if column.startswith("occupation-hours-interaction-")
+            )
+
+        return selected
+
+
+def build_preprocessor(
+    config: PreprocessingConfig | None = None,
+) -> Pipeline:
+    """
+    Build the complete feature preprocessing pipeline.
+
+    Pipeline stages
+    ---------------
+    1. EDA-driven feature engineering.
+    2. Optional occupation-hours interactions.
+    3. Numerical imputation and scaling.
+    4. Categorical imputation and one-hot encoding.
+
+    The returned pipeline is unfitted.
+
+    It should be combined with a classifier for
+    cross-validation.
+    """
+
+    if config is None:
+        config = PreprocessingConfig()
+
+    numerical_features, categorical_features = get_feature_groups(config)
+
+    # --------------------------------------------------------
+    # Numerical pipeline
+    # --------------------------------------------------------
+
+    numerical_steps = [
+        (
+            "imputer",
+            SimpleImputer(
+                strategy=config.numerical_imputation,
+                keep_empty_features=True,
+            ),
+        )
+    ]
+
+    if config.numerical_scaling == "standard":
+        numerical_steps.append(("scaler", StandardScaler()))
+
+    elif config.numerical_scaling == "robust":
+        numerical_steps.append(("scaler", RobustScaler()))
+
+    numerical_pipeline = Pipeline(steps=numerical_steps)
+
+    # --------------------------------------------------------
+    # Categorical pipeline
+    # --------------------------------------------------------
+
+    if config.categorical_imputation == "constant":
+        categorical_imputer = SimpleImputer(
+            strategy="constant",
+            fill_value=config.missing_category,
+            keep_empty_features=True,
+        )
+
+    else:
+        categorical_imputer = SimpleImputer(
+            strategy="most_frequent",
+            keep_empty_features=True,
+        )
+
+    categorical_encoder = OneHotEncoder(
+        handle_unknown=(
+            "infrequent_if_exist"
+            if config.rare_category_frequency is not None
+            else "ignore"
+        ),
+        min_frequency=config.rare_category_frequency,
+        sparse_output=False,
     )
 
-    # Categorical preprocessing pipeline
     categorical_pipeline = Pipeline(
         steps=[
-            (
-                "imputer",
-                SimpleImputer(strategy="most_frequent"),
-            ),
-            (
-                "encoder",
-                OneHotEncoder(
-                    handle_unknown="ignore",
-                    sparse_output=False,
-                )
-            )
+            ("imputer", categorical_imputer),
+            ("encoder", categorical_encoder),
         ]
     )
 
-    # Apply the appropriate pipeline to each feature group.
-    preprocessor = ColumnTransformer(
-        transformer=[
-           ( 
-               "numerical",
+    # --------------------------------------------------------
+    # ColumnTransformer
+    # --------------------------------------------------------
+
+    column_transformer = ColumnTransformer(
+        transformers=[
+            (
+                "numerical",
                 numerical_pipeline,
-                NUMERICAL_FEATURES,
+                NumericalFeatureSelector(
+                    feature_names=numerical_features,
+                    include_interactions=config.interaction_features,
+                ),
             ),
             (
                 "categorical",
                 categorical_pipeline,
-                CATEGORICAL_FEATURES,
-            )
+                categorical_features,
+            ),
         ],
         remainder="drop",
-        verbose_feature_names_out=False
+        verbose_feature_names_out=False,
     )
 
-    return preprocessor
+    # --------------------------------------------------------
+    # Complete preprocessing pipeline
+    # --------------------------------------------------------
+
+    steps = [
+        (
+            "feature_engineering",
+            AdultFeatureEngineer(
+                capital_transform=config.capital_transform,
+                capital_indicators=config.capital_indicators,
+                education_representation=(config.education_representation),
+                interaction_features=config.interaction_features,
+            ),
+        )
+    ]
+
+    if config.interaction_features:
+        steps.append(
+            (
+                "occupation_interactions",
+                OccupationHoursTransformer(),
+            )
+        )
+
+    steps.append(("column_transformer", column_transformer))
+
+    return Pipeline(steps=steps)
+
 
 # ============================================================
-# 8. Transform training and testing datasets
+# 14. Transform training and testing datasets
 # ============================================================
+
 
 def transform_datasets(
-        preprocessor: ColumnTransformer,
-        X_train: pd.DataFrame,
-        X_test: pd.DataFrame,
+    preprocessor: Pipeline,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Fit the preprocessor on training data and transform both training and testing datasets.
+    Fit the preprocessor on training data only.
 
-    Important
-    ---------
-    The preprocessor is fitted only on training data to prevent data leakage.
+    Then apply the fitted transformations to testing data.
+
+    This function is appropriate for generating a fixed
+    train/test representation.
+
+    For model cross-validation, use the unfitted
+    preprocessor inside a classifier Pipeline instead.
     """
-    # Learn imputation values, scaling statistics, and categorical mappings from training data.
-    X_train_transformed = preprocessor.fit_transform(
-        X_train
-    )
 
-    # Apply the learned transformations to testing data.
-    X_test_transformed = preprocessor.transform(
-        X_test
-    )
+    train_array = preprocessor.fit_transform(X_train)
 
-    # Retrieve transformed feature names.
-    features_names = preprocessor.get_feature_names_out()
+    test_array = preprocessor.transform(X_test)
 
-    # Convert the transformed arrays into DataFrames
-    X_train_processed = pd.DataFrame(
-        X_train_transformed,
-        columns=features_names,
+    feature_names = preprocessor.get_feature_names_out()
+
+    train_processed = pd.DataFrame(
+        train_array,
+        columns=feature_names,
         index=X_train.index,
     )
 
-    X_test_processed = pd.DataFrame(
-        X_test_transformed,
-        columns=features_names,
+    test_processed = pd.DataFrame(
+        test_array,
+        columns=feature_names,
         index=X_test.index,
     )
 
-    return X_train_processed, X_test_processed
+    return train_processed, test_processed
+
+
+# ============================================================
+# 15. Save processed datasets
+# ============================================================
+
 
 def save_processed_data(
-        X_train: pd.DataFrame,
-        X_test: pd.DataFrame,
-        y_train: pd.Series,
-        y_test: pd.Series,
-        output_dir: str | Path,
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    output_dir: str | Path,
 ) -> None:
     """
-    Save processed training and testing datasets as CSV.
+    Save the transformed training and testing datasets.
     """
 
-    output_path = Path(output_dir)
+    output_dir = Path(output_dir)
 
-    # Create the output directory if it does not exist.
-    output_path.mkdir(
+    output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    # Save feature matrices.
     X_train.to_csv(
-        output_path / "X_train.csv",
-        index=False
-    )
-
-    X_train.to_frame(name=TARGET_COLUMN).to_csv(
-        output_path / "y_train.csv",
+        output_dir / "X_train.csv",
         index=False,
     )
 
+    X_test.to_csv(
+        output_dir / "X_test.csv",
+        index=False,
+    )
+
+    y_train.to_csv(
+        output_dir / "y_train.csv",
+        index=False,
+    )
+
+    y_test.to_csv(
+        output_dir / "y_test.csv",
+        index=False,
+    )
+
+
 # ============================================================
-# 10. Save fitted preprocessing transformer
+# 16. Save fitted preprocessor
 # ============================================================
+
 
 def save_preprocessor(
-        preprocessor: ColumnTransformer,
-        output_path: str | Path,
+    preprocessor: Pipeline,
+    output_path: str | Path,
 ) -> None:
     """
-    Save the fitted preprocessing transformer.
-
-    The saved object contains:
-    - Numerical imputation statistics.
-    - Feature scaling parameters.
-    - Categorical imputation values.
-    - One-hot encoding mappings.
+    Serialize a fitted preprocessing pipeline using joblib.
     """
 
-    file_path = Path(output_path)
+    output_path = Path(output_path)
 
-    # Ensure the destination directory exists.
-    file_path.parent.mkdir(
+    output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    # Serialize the fitted preprocessing object.
     joblib.dump(
         preprocessor,
-        file_path,
+        output_path,
     )
 
+
 # ============================================================
-# 11. Execute complete preprocessing pipeline
+# 17. Save preprocessing configuration
 # ============================================================
 
+
+def save_config(
+    config: PreprocessingConfig,
+    output_path: str | Path,
+) -> None:
+    """
+    Save the preprocessing configuration as JSON.
+
+    This makes the experiment settings reproducible
+    and easy to inspect or log with MLflow.
+    """
+
+    output_path = Path(output_path)
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with output_path.open(
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            asdict(config),
+            file,
+            indent=4,
+        )
+
+
+# ============================================================
+# 18. Run complete preprocessing workflow
+# ============================================================
+
+
 def run_preprocessing_pipeline(
-        paths: Sequence[str | Path],
-        output_dir: str | Path,
-        preprocessor_path: str | Path,
-        test_size: float = TEST_SIZE,
-        random_state: int = RANDOM_STATE,
-        remove_duplicates: bool = False
+    paths: Sequence[str | Path],
+    output_dir: str | Path,
+    preprocessor_path: str | Path,
+    config: PreprocessingConfig | None = None,
+    remove_duplicates: bool = False,
 ) -> dict:
     """
     Execute the complete preprocessing workflow.
 
-    Parameters
-    ----------
-    paths: Sequence[str | Path]
-        List of raw dataset file paths.
-
-    output_dir: str | Path
-        Directory for processed datasets.
-    
-    preprocessor_path : str | Path
-        Destination for the fitted transformer.
-    
-    test_size : float
-        Fraction of data reserved for testing
-    
-    random_state : int
-        Random seed for reproducibility
-    
     Returns
     -------
     dict
-        Summary of preprocessing results
+        Summary of the preprocessing execution.
     """
 
-    # Step 1: Load and concatenate raw files.
-    df = load_and_concatenate_data(paths)
+    if config is None:
+        config = PreprocessingConfig()
 
-    raw_rows = len(df)
+    # --------------------------------------------------------
+    # Load raw data
+    # --------------------------------------------------------
 
-    # Step 2: Clean the combined dataset.
-    df = clean_data(
-        df,
+    raw_df = load_and_concatenate_data(paths)
+
+    raw_rows = len(raw_df)
+
+    # --------------------------------------------------------
+    # Clean and validate
+    # --------------------------------------------------------
+
+    cleaned_df = clean_data(
+        raw_df,
         remove_duplicates=remove_duplicates,
     )
 
-    # Step 3: Validate the cleaned dataset
-    validate_data(df)
+    validate_data(cleaned_df)
 
-    # Step 4: Encode the binary target
-    df = encode_target(df)
+    cleaned_rows = len(cleaned_df)
 
-    # Step 5: Separate features and target.
-    X, y = split_features_target(df)
+    # --------------------------------------------------------
+    # Encode target
+    # --------------------------------------------------------
 
-    # Step 6: Create stratified train/test partitions
-    X_train, X_test, y_train, y_test = (
-        create_train_test_split(
-            X,
-            y,
-            test_size=TEST_SIZE,
-            random_state=RANDOM_STATE,
-        )
+    encoded_df = encode_target(cleaned_df)
+
+    # --------------------------------------------------------
+    # Separate predictors and target
+    # --------------------------------------------------------
+
+    X, y = split_features_target(encoded_df)
+
+    # --------------------------------------------------------
+    # Train/test split
+    # --------------------------------------------------------
+
+    X_train, X_test, y_train, y_test = create_train_test_split(
+        X,
+        y,
+        test_size=config.test_size,
+        random_state=config.random_state,
+        duplicate_aware=config.duplicate_aware_split,
     )
 
-    # Step 7: Create the preprocessing transformer
-    preprocessor = build_preprocessor()
+    # --------------------------------------------------------
+    # Build and fit preprocessor
+    # --------------------------------------------------------
 
-    # Step 8: Fit on training data and transform both sets.
-    X_train_processed, X_test_processed = (
-        transform_datasets(
-            preprocessor,
-            X_train,
-            y_test,
-        )
+    preprocessor = build_preprocessor(config)
+
+    X_train_processed, X_test_processed = transform_datasets(
+        preprocessor,
+        X_train,
+        X_test,
     )
 
-    # Step 9: Save processed datasets.
+    # --------------------------------------------------------
+    # Save artifacts
+    # --------------------------------------------------------
+
     save_processed_data(
         X_train_processed,
         X_test_processed,
@@ -646,72 +1376,105 @@ def run_preprocessing_pipeline(
         output_dir,
     )
 
-    # Step 10: Save the fitted preprocessing transformer.
     save_preprocessor(
         preprocessor,
         preprocessor_path,
     )
 
-    # Step 11: Return a summary for logging and validation
+    save_config(
+        config,
+        Path(output_dir) / "preprocessing_config.json",
+    )
+
+    # --------------------------------------------------------
+    # Execution summary
+    # --------------------------------------------------------
+
     summary = {
         "raw_rows": raw_rows,
-        "cleaned_rows": len(df),
-        "training_rows": len(X_train_processed),
-        "testing_rows": len(X_test_processed),
+        "cleaned_rows": cleaned_rows,
+        "training_rows": len(X_train),
+        "testing_rows": len(X_test),
         "original_features": X.shape[1],
-        "processed_feature": X_train_processed.shape[1],
-        "train_positive_rate": float(y_train.mean()),
-        "test_positive_rate": float(y_test.mean()),
-        "random_state": random_state,
-        "test_size": test_size,
+        "processed_features": X_train_processed.shape[1],
+        "training_positive_rate": float(y_train.mean()),
+        "testing_positive_rate": float(y_test.mean()),
+        "test_size": config.test_size,
+        "random_state": config.random_state,
+        "duplicate_aware_split": config.duplicate_aware_split,
+        "remove_duplicates": remove_duplicates,
+        "configuration": asdict(config),
     }
 
     return summary
 
+
 # ============================================================
-# 12. Main execution
+# 19. Main execution
 # ============================================================
 
-def main() -> None:
+
+def main():
     """
-    Run preprocessing using the project'directory structure
+    Execute preprocessing using the default EDA-driven
+    configuration.
+
+    Run from the project root:
+
+        python -m src.data.preprocess
     """
 
-    # Resolve project root relative to this script:
-    # project_root/src/data/preprocess.py
+    # Resolve project root from this module's location.
     project_root = Path(__file__).resolve().parents[2]
 
-    # Define the raw input files.
     raw_paths = [
         project_root / "data/raw/adult.data",
         project_root / "data/raw/adult.test",
     ]
 
-    # Define output location
-    processed_dir = project_root / "data/processed"
+    output_dir = project_root / "data/processed"
 
-    preprocessor_path = (
-        project_root / "models/preprocessor.joblib"
+    preprocessor_path = project_root / "models/preprocessor.joblib"
+
+    # EDA-driven starting configuration.
+    config = PreprocessingConfig(
+        categorical_imputation="constant",
+        missing_category="Unknown",
+        rare_category_frequency=0.01,
+        numerical_imputation="median",
+        numerical_scaling="standard",
+        capital_transform="log1p",
+        capital_indicators=True,
+        education_representation="education-num",
+        interaction_features=False,
+        duplicate_aware_split=True,
+        test_size=0.20,
+        random_state=42,
     )
 
-    # Execute the complete preprocessing workflow
     summary = run_preprocessing_pipeline(
         paths=raw_paths,
-        output_dir=processed_dir,
+        output_dir=output_dir,
         preprocessor_path=preprocessor_path,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
-        remove_duplicates=False
+        config=config,
+        remove_duplicates=False,
     )
 
-    # Display a concise execution summary
     print("\nPreprocessing completed successfully.\n")
 
     for key, value in summary.items():
         print(f"{key}: {value}")
 
-# Execute only when file is run directly.
-# Importing its functions from another module will not
-# automatically execute the preprocessor pipeline
+
 if __name__ == "__main__":
-    main()
+    # Keep serialized custom transformers importable in a fresh Python process.
+    # Also allow `python src/data/preprocess.py` by adding the project root.
+    import sys
+
+    project_root = str(Path(__file__).resolve().parents[2])
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    from src.data.preprocess import main as run_main
+
+    run_main()

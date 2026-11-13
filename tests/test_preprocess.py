@@ -45,6 +45,7 @@ from src.data.preprocess import (
     build_preprocessor,
     clean_data,
     create_train_test_split,
+    create_train_val_test_split,
     encode_target,
     get_feature_groups,
     load_and_concatenate_data,
@@ -184,6 +185,7 @@ class TestPreprocessingConfig:
 
         assert config.duplicate_aware_split is True
         assert config.test_size == 0.20
+        assert config.validation_size == 0.20
         assert config.random_state == 42
 
     @pytest.mark.parametrize(
@@ -199,6 +201,8 @@ class TestPreprocessingConfig:
             ("education_representation", "invalid"),
             ("test_size", 0),
             ("test_size", 1),
+            ("validation_size", 0),
+            ("validation_size", 1),
             ("random_state", 3.5),
         ],
     )
@@ -1322,7 +1326,7 @@ class TestPreprocessingIntegration:
         assert summary["raw_rows"] == 12
         assert summary["cleaned_rows"] == 12
 
-        assert summary["training_rows"] + summary["testing_rows"] == 12
+        assert summary["training_rows"] + summary["validation_rows"] + summary["testing_rows"] == 12
 
         assert summary["original_features"] == 14
         assert summary["processed_features"] > 0
@@ -1340,8 +1344,10 @@ class TestPreprocessingIntegration:
         expected_files = [
             output_dir / "X_train.csv",
             output_dir / "X_test.csv",
+            output_dir / "X_val.csv",
             output_dir / "y_train.csv",
             output_dir / "y_test.csv",
+            output_dir / "y_val.csv",
             output_dir / "preprocessing_config.json",
             preprocessor_path,
         ]
@@ -1356,7 +1362,7 @@ class TestPreprocessingIntegration:
         """
 
         assert (
-            summary["training_rows"] + summary["testing_rows"]
+            summary["training_rows"] + summary["validation_rows"] + summary["testing_rows"]
             == summary["cleaned_rows"]
         )
 
@@ -1377,7 +1383,7 @@ class TestPreprocessingIntegration:
                 config=default_config,
             )
 
-        for filename in ["X_train.csv", "X_test.csv", "y_train.csv", "y_test.csv"]:
+        for filename in ["X_train.csv", "X_val.csv", "X_test.csv", "y_train.csv", "y_val.csv", "y_test.csv"]:
             pd.testing.assert_frame_equal(
                 pd.read_csv(output_a / filename),
                 pd.read_csv(output_b / filename),
@@ -1662,3 +1668,78 @@ class TestPreprocessingRegressions:
         )
         assert check.returncode == 0, check.stdout + check.stderr
         assert (project / "data/processed/X_train.csv").is_file()
+
+# ============================================================
+# 21. Three-way split and validation leakage regression tests
+# ============================================================
+
+class TestThreeWaySplit:
+    def test_three_way_split_preserves_all_rows(self, features_target):
+        X, y = features_target
+        X_train, X_val, X_test, y_train, y_val, y_test = create_train_val_test_split(
+            X, y, duplicate_aware=False,
+        )
+        assert len(X_train) + len(X_val) + len(X_test) == len(X)
+        assert len(y_train) + len(y_val) + len(y_test) == len(y)
+        assert set(X_train.index).isdisjoint(X_val.index)
+        assert set(X_train.index).isdisjoint(X_test.index)
+        assert set(X_val.index).isdisjoint(X_test.index)
+        for features, labels in ((X_train, y_train), (X_val, y_val), (X_test, y_test)):
+            assert features.index.equals(labels.index)
+
+    def test_group_separation_and_duplicate_preservation(self, duplicate_groups_df):
+        X, y = split_features_target(encode_target(duplicate_groups_df))
+        parts = create_train_val_test_split(X, y, duplicate_aware=True)
+        X_train, X_val, X_test, y_train, y_val, y_test = parts
+        assert sum(map(len, (X_train, X_val, X_test))) == len(X)
+        assert sum(map(len, (y_train, y_val, y_test))) == len(y)
+        ids = get_feature_group_ids(pd.concat([X_train, X_val, X_test]))
+        a = set(ids[:len(X_train)])
+        b = set(ids[len(X_train):len(X_train)+len(X_val)])
+        c = set(ids[len(X_train)+len(X_val):])
+        assert a.isdisjoint(b) and a.isdisjoint(c) and b.isdisjoint(c)
+
+    def test_three_way_split_reproducible(self, features_target):
+        X, y = features_target
+        a = create_train_val_test_split(X, y, duplicate_aware=False)
+        b = create_train_val_test_split(X, y, duplicate_aware=False)
+        for left, right in zip(a, b):
+            if isinstance(left, pd.DataFrame):
+                pd.testing.assert_frame_equal(left, right)
+            else:
+                pd.testing.assert_series_equal(left, right)
+
+    def test_validation_does_not_fit_preprocessor(self, split_three_data, default_config):
+        X_train, X_val, X_test, *_ = split_three_data
+        preprocessor = build_preprocessor(default_config)
+        train, val, test = transform_datasets(preprocessor, X_train, X_test, X_val=X_val)
+        assert train.columns.equals(val.columns)
+        assert train.columns.equals(test.columns)
+        scaler = get_numerical_pipeline(preprocessor).named_steps["scaler"]
+        assert scaler.mean_[0] == pytest.approx(X_train["age"].mean())
+        original = scaler.mean_.copy()
+        extreme = X_val.copy()
+        extreme["age"] = 1_000_000
+        preprocessor.transform(extreme)
+        np.testing.assert_array_equal(scaler.mean_, original)
+
+    def test_save_six_artifacts(self, split_three_data, default_config, output_dir):
+        X_train, X_val, X_test, y_train, y_val, y_test = split_three_data
+        train, val, test = transform_datasets(
+            build_preprocessor(default_config), X_train, X_test, X_val=X_val,
+        )
+        save_processed_data(train, test, y_train, y_test, output_dir, X_val=val, y_val=y_val)
+        for name in ("X_train", "X_val", "X_test", "y_train", "y_val", "y_test"):
+            assert (output_dir / f"{name}.csv").is_file()
+
+    def test_same_split_for_all_configurations(self, features_target, alternative_configs):
+        X, y = features_target
+        reference = create_train_val_test_split(X, y, duplicate_aware=False)
+        for config in alternative_configs.values():
+            parts = create_train_val_test_split(
+                X, y, test_size=config.test_size,
+                validation_size=config.validation_size,
+                random_state=config.random_state, duplicate_aware=False,
+            )
+            for actual, expected in zip(parts, reference):
+                assert actual.index.equals(expected.index)

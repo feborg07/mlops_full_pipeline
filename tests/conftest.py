@@ -43,6 +43,7 @@ from src.data.preprocess import (
     PreprocessingConfig,
     build_preprocessor,
     create_train_test_split,
+    create_train_val_test_split,
     encode_target,
     split_features_target,
 )
@@ -783,3 +784,12 @@ def missing_occupation_features(sample_adult_df):
     X["occupation"] = X["occupation"].astype("string")
     X.loc[X.index[:2], "occupation"] = pd.NA
     return X
+
+@pytest.fixture
+def split_three_data(features_target):
+    """Deterministic three-way split for unit tests."""
+    X, y = features_target
+    return create_train_val_test_split(
+        X, y, test_size=0.25, validation_size=0.25,
+        random_state=42, duplicate_aware=False,
+    )

@@ -243,6 +243,7 @@ class PreprocessingConfig:
     duplicate_aware_split: bool = True
 
     test_size: float = TEST_SIZE
+    validation_size: float = 0.20  # Fraction of the development (non-test) partition.
     random_state: int = RANDOM_STATE
 
     def __post_init__(self):
@@ -302,6 +303,13 @@ class PreprocessingConfig:
             raise ValueError("test_size must be between 0 and 1.")
 
         if (
+            isinstance(self.validation_size, bool)
+            or not isinstance(self.validation_size, Real)
+            or not 0 < self.validation_size < 1
+        ):
+            raise ValueError("validation_size must be between 0 and 1.")
+
+        if (
             isinstance(self.random_state, bool)
             or not isinstance(self.random_state, Integral)
             or not 0 <= self.random_state <= 2**32 - 1
@@ -314,6 +322,7 @@ class PreprocessingConfig:
         # Normalize NumPy scalar values for JSON serialization.
         object.__setattr__(self, "random_state", int(self.random_state))
         object.__setattr__(self, "test_size", float(self.test_size))
+        object.__setattr__(self, "validation_size", float(self.validation_size))
         if frequency is not None:
             object.__setattr__(self, "rare_category_frequency", float(frequency))
 
@@ -671,6 +680,34 @@ def create_train_test_split(
         raise RuntimeError("Train/test split lost observations or assigned them twice.")
 
     return X_train, X_test, y_train, y_test
+
+
+def create_train_val_test_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float = TEST_SIZE,
+    validation_size: float = 0.20,
+    random_state: int = RANDOM_STATE,
+    duplicate_aware: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """Create train/validation/test partitions using the existing group-aware splitter.
+
+    validation_size is relative to the development partition, not the full dataset.
+    With test_size=.20 and validation_size=.20 the approximate fractions are
+    64% training, 16% validation, and 20% testing.
+    """
+    config = PreprocessingConfig(
+        test_size=test_size, validation_size=validation_size, random_state=random_state
+    )
+    X_dev, X_test, y_dev, y_test = create_train_test_split(
+        X, y, test_size=config.test_size, random_state=config.random_state,
+        duplicate_aware=duplicate_aware,
+    )
+    X_train, X_val, y_train, y_val = create_train_test_split(
+        X_dev, y_dev, test_size=config.validation_size,
+        random_state=config.random_state, duplicate_aware=duplicate_aware,
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
 
 # ============================================================
@@ -1145,38 +1182,25 @@ def transform_datasets(
     preprocessor: Pipeline,
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    X_val: pd.DataFrame | None = None,
+):
+    """Fit on training only; transform test and optional validation unchanged.
+
+    The two-way API remains available for existing callers. When X_val is
+    provided, return (train, validation, test) processed DataFrames.
     """
-    Fit the preprocessor on training data only.
-
-    Then apply the fitted transformations to testing data.
-
-    This function is appropriate for generating a fixed
-    train/test representation.
-
-    For model cross-validation, use the unfitted
-    preprocessor inside a classifier Pipeline instead.
-    """
-
     train_array = preprocessor.fit_transform(X_train)
-
-    test_array = preprocessor.transform(X_test)
-
     feature_names = preprocessor.get_feature_names_out()
 
-    train_processed = pd.DataFrame(
-        train_array,
-        columns=feature_names,
-        index=X_train.index,
-    )
+    def frame(X, values):
+        return pd.DataFrame(values, columns=feature_names, index=X.index)
 
-    test_processed = pd.DataFrame(
-        test_array,
-        columns=feature_names,
-        index=X_test.index,
-    )
-
-    return train_processed, test_processed
+    train_processed = frame(X_train, train_array)
+    test_processed = frame(X_test, preprocessor.transform(X_test))
+    if X_val is None:
+        return train_processed, test_processed
+    val_processed = frame(X_val, preprocessor.transform(X_val))
+    return train_processed, val_processed, test_processed
 
 
 # ============================================================
@@ -1190,37 +1214,23 @@ def save_processed_data(
     y_train: pd.Series,
     y_test: pd.Series,
     output_dir: str | Path,
+    *,
+    X_val: pd.DataFrame | None = None,
+    y_val: pd.Series | None = None,
 ) -> None:
-    """
-    Save the transformed training and testing datasets.
-    """
-
+    """Save train/test and, when supplied, validation datasets as CSV files."""
+    if (X_val is None) != (y_val is None):
+        raise ValueError("X_val and y_val must both be supplied or both omitted.")
     output_dir = Path(output_dir)
-
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    X_train.to_csv(
-        output_dir / "X_train.csv",
-        index=False,
-    )
-
-    X_test.to_csv(
-        output_dir / "X_test.csv",
-        index=False,
-    )
-
-    y_train.to_csv(
-        output_dir / "y_train.csv",
-        index=False,
-    )
-
-    y_test.to_csv(
-        output_dir / "y_test.csv",
-        index=False,
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name, data in (
+        ("X_train", X_train), ("X_test", X_test),
+        ("y_train", y_train), ("y_test", y_test),
+    ):
+        data.to_csv(output_dir / f"{name}.csv", index=False)
+    if X_val is not None:
+        X_val.to_csv(output_dir / "X_val.csv", index=False)
+        y_val.to_csv(output_dir / "y_val.csv", index=False)
 
 
 # ============================================================
@@ -1341,15 +1351,12 @@ def run_preprocessing_pipeline(
     X, y = split_features_target(encoded_df)
 
     # --------------------------------------------------------
-    # Train/test split
+    # Train/validation/test split
     # --------------------------------------------------------
 
-    X_train, X_test, y_train, y_test = create_train_test_split(
-        X,
-        y,
-        test_size=config.test_size,
-        random_state=config.random_state,
-        duplicate_aware=config.duplicate_aware_split,
+    X_train, X_val, X_test, y_train, y_val, y_test = create_train_val_test_split(
+        X, y, test_size=config.test_size, validation_size=config.validation_size,
+        random_state=config.random_state, duplicate_aware=config.duplicate_aware_split,
     )
 
     # --------------------------------------------------------
@@ -1358,10 +1365,8 @@ def run_preprocessing_pipeline(
 
     preprocessor = build_preprocessor(config)
 
-    X_train_processed, X_test_processed = transform_datasets(
-        preprocessor,
-        X_train,
-        X_test,
+    X_train_processed, X_val_processed, X_test_processed = transform_datasets(
+        preprocessor, X_train, X_test, X_val=X_val,
     )
 
     # --------------------------------------------------------
@@ -1374,6 +1379,8 @@ def run_preprocessing_pipeline(
         y_train,
         y_test,
         output_dir,
+        X_val=X_val_processed,
+        y_val=y_val,
     )
 
     save_preprocessor(
@@ -1394,12 +1401,15 @@ def run_preprocessing_pipeline(
         "raw_rows": raw_rows,
         "cleaned_rows": cleaned_rows,
         "training_rows": len(X_train),
+        "validation_rows": len(X_val),
         "testing_rows": len(X_test),
         "original_features": X.shape[1],
         "processed_features": X_train_processed.shape[1],
         "training_positive_rate": float(y_train.mean()),
+        "validation_positive_rate": float(y_val.mean()),
         "testing_positive_rate": float(y_test.mean()),
         "test_size": config.test_size,
+        "validation_size": config.validation_size,
         "random_state": config.random_state,
         "duplicate_aware_split": config.duplicate_aware_split,
         "remove_duplicates": remove_duplicates,

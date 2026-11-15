@@ -24,11 +24,12 @@ Required inputs for each preprocessing variant:
 The script:
     - Never reloads raw datasets.
     - Never recreates dataset splits.
-    - Never refits the saved preprocessing transformers.
+    - Never refits saved preprocessing transformers.
     - Fits candidate models using training data only.
     - Selects models and thresholds using validation data.
     - Evaluates winners using held-out test data.
     - Tracks experiments using MLflow.
+    - Preserves feature names in deployable pipelines.
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ import argparse
 import hashlib
 import json
 import logging
+import shutil
 import warnings
 
 from dataclasses import dataclass
@@ -50,15 +52,12 @@ import pandas as pd
 
 from sklearn.base import clone
 from sklearn.exceptions import ConvergenceWarning
-
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     HistGradientBoostingClassifier,
     RandomForestClassifier,
 )
-
 from sklearn.linear_model import LogisticRegression
-
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -69,9 +68,11 @@ from sklearn.metrics import (
     roc_auc_score,
     precision_recall_curve,
 )
-
 from sklearn.pipeline import Pipeline, make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import (
+    FunctionTransformer,
+    StandardScaler,
+)
 
 
 # ============================================================
@@ -121,15 +122,12 @@ def load_variant(
     variant: str,
 ) -> Dataset:
     """
-    Load the exact partitions generated during preprocessing.
+    Load partitions generated during preprocessing.
 
     No splitting, cleaning, or preprocessing is performed.
-
-    Raises errors when required artifacts are missing or invalid.
     """
 
     folder = processed_dir / variant
-
     matrices = {}
 
     for split in ("train", "val", "test"):
@@ -138,7 +136,6 @@ def load_variant(
         y_path = folder / f"y_{split}.csv"
 
         for path in (x_path, y_path):
-
             if not path.is_file():
                 raise FileNotFoundError(
                     f"Required partition missing: {path}. "
@@ -150,7 +147,7 @@ def load_variant(
 
         if y_frame.shape[1] != 1:
             raise ValueError(
-                f"Expected one target column: {y_path}"
+                f"Expected exactly one target column: {y_path}"
             )
 
         y = y_frame.iloc[:, 0]
@@ -262,10 +259,7 @@ def candidates(quick: bool = False):
 
     specs = []
 
-    # --------------------------------------------------------
     # Logistic Regression
-    # --------------------------------------------------------
-
     for c, weight in product(
         (0.1, 1.0, 10.0),
         (None, "balanced"),
@@ -289,17 +283,10 @@ def candidates(quick: bool = False):
         )
 
         specs.append(
-            (
-                "logistic_regression",
-                params,
-                estimator,
-            )
+            ("logistic_regression", params, estimator)
         )
 
-    # --------------------------------------------------------
     # Random Forest
-    # --------------------------------------------------------
-
     for depth, leaf in product(
         (None, 15),
         (1, 5),
@@ -318,17 +305,10 @@ def candidates(quick: bool = False):
         )
 
         specs.append(
-            (
-                "random_forest",
-                params,
-                estimator,
-            )
+            ("random_forest", params, estimator)
         )
 
-    # --------------------------------------------------------
     # Histogram Gradient Boosting
-    # --------------------------------------------------------
-
     for rate, leaves in product(
         (0.05, 0.1),
         (15, 31),
@@ -346,17 +326,10 @@ def candidates(quick: bool = False):
         )
 
         specs.append(
-            (
-                "hist_gradient_boosting",
-                params,
-                estimator,
-            )
+            ("hist_gradient_boosting", params, estimator)
         )
 
-    # --------------------------------------------------------
     # Extra Trees
-    # --------------------------------------------------------
-
     for depth, leaf in product(
         (None, 15),
         (1, 5),
@@ -375,16 +348,8 @@ def candidates(quick: bool = False):
         )
 
         specs.append(
-            (
-                "extra_trees",
-                params,
-                estimator,
-            )
+            ("extra_trees", params, estimator)
         )
-
-    # --------------------------------------------------------
-    # Quick mode
-    # --------------------------------------------------------
 
     if quick:
 
@@ -397,8 +362,7 @@ def candidates(quick: bool = False):
 
         return [
             next(
-                spec
-                for spec in specs
+                spec for spec in specs
                 if spec[0] == family
             )
             for family in families
@@ -416,16 +380,13 @@ def optimal_threshold(
     probabilities: np.ndarray,
 ) -> float:
     """
-    Find the probability threshold maximizing validation F1.
+    Find the threshold maximizing validation F1.
 
     The test set is never used for threshold optimization.
     """
 
     precision, recall, thresholds = (
-        precision_recall_curve(
-            y,
-            probabilities,
-        )
+        precision_recall_curve(y, probabilities)
     )
 
     if not len(thresholds):
@@ -453,11 +414,7 @@ def evaluate(
     probabilities: np.ndarray,
     threshold: float,
 ) -> dict:
-    """
-    Calculate classification metrics using a fixed threshold.
-
-    The threshold must be selected using validation data.
-    """
+    """Calculate metrics using a fixed decision threshold."""
 
     predictions = (
         probabilities >= threshold
@@ -471,58 +428,27 @@ def evaluate(
 
     return {
         "f1": float(
-            f1_score(
-                y,
-                predictions,
-                zero_division=0,
-            )
+            f1_score(y, predictions, zero_division=0)
         ),
-
         "precision": float(
-            precision_score(
-                y,
-                predictions,
-                zero_division=0,
-            )
+            precision_score(y, predictions, zero_division=0)
         ),
-
         "recall": float(
-            recall_score(
-                y,
-                predictions,
-                zero_division=0,
-            )
+            recall_score(y, predictions, zero_division=0)
         ),
-
         "accuracy": float(
-            accuracy_score(
-                y,
-                predictions,
-            )
+            accuracy_score(y, predictions)
         ),
-
         "pr_auc": (
-            float(
-                average_precision_score(
-                    y,
-                    probabilities,
-                )
-            )
+            float(average_precision_score(y, probabilities))
             if y.nunique() == 2
             else None
         ),
-
         "roc_auc": (
-            float(
-                roc_auc_score(
-                    y,
-                    probabilities,
-                )
-            )
+            float(roc_auc_score(y, probabilities))
             if y.nunique() == 2
             else None
         ),
-
         "confusion_matrix": cm.tolist(),
     }
 
@@ -533,7 +459,7 @@ def evaluate(
 
 def rank(row: dict):
     """
-    Rank models using validation metrics.
+    Rank candidates using validation metrics.
 
     Priority:
         1. F1
@@ -558,7 +484,6 @@ def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
 
     with path.open("rb") as file:
-
         for block in iter(
             lambda: file.read(1024 * 1024),
             b"",
@@ -577,9 +502,7 @@ def configure_mlflow(
     db: Path,
     artifacts: Path,
 ):
-    """
-    Configure local MLflow tracking using SQLite.
-    """
+    """Configure local MLflow tracking using SQLite."""
 
     db.parent.mkdir(
         parents=True,
@@ -602,7 +525,6 @@ def configure_mlflow(
     )
 
     if existing is None:
-
         mlflow.create_experiment(
             experiment,
             artifact_location=(
@@ -614,7 +536,66 @@ def configure_mlflow(
 
 
 # ============================================================
-# 10. Main training workflow
+# 10. Deployable pipeline construction
+# ============================================================
+
+def build_deployable_pipeline(
+    fitted_preprocessor,
+    classifier,
+    feature_names,
+    sample_features,
+):
+    """
+    Assemble an inference pipeline without refitting models.
+
+    The fitted preprocessor produces a NumPy array.
+    The classifier was fitted with named DataFrame columns.
+
+    FunctionTransformer restores those column names only after
+    preprocessing, avoiding feature-name warnings.
+
+    The adapter does not alter numerical feature values.
+    """
+
+    feature_names = list(feature_names)
+
+    # Verify the classifier's expected feature names.
+    if hasattr(classifier, "feature_names_in_"):
+
+        classifier_names = list(
+            classifier.feature_names_in_
+        )
+
+        if classifier_names != feature_names:
+            raise ValueError(
+                "Classifier feature names do not match "
+                "the fitted preprocessor output."
+            )
+
+    # Convert NumPy output to a named DataFrame.
+    # pandas.DataFrame is importable and joblib-compatible.
+    adapter = FunctionTransformer(
+        pd.DataFrame,
+        kw_args={"columns": feature_names},
+        validate=False,
+        feature_names_out="one-to-one",
+    )
+
+    # Fit only the stateless adapter's metadata.
+    # The preprocessor and classifier are NOT refitted.
+    adapter.fit(sample_features)
+
+    deployable = Pipeline([
+        ("preprocess", fitted_preprocessor),
+        ("feature_names", adapter),
+        ("classifier", classifier),
+    ])
+
+    return deployable
+
+
+# ============================================================
+# 11. Main training workflow
 # ============================================================
 
 def train(args):
@@ -622,10 +603,10 @@ def train(args):
     Run model selection across preprocessing configurations.
 
     Training:
-        Fit candidate classifiers using training data.
+        Fit candidates using training data.
 
     Validation:
-        Optimize decision thresholds and select winners.
+        Optimize thresholds and select winners.
 
     Testing:
         Evaluate each winning model once.
@@ -635,7 +616,6 @@ def train(args):
 
     processed = args.processed_dir.resolve()
     preprocessor_dir = args.preprocessor_dir.resolve()
-
     output = args.output_dir.resolve()
 
     output.mkdir(
@@ -646,10 +626,7 @@ def train(args):
     db = args.mlflow_db.resolve()
     artifacts = args.mlflow_artifacts.resolve()
 
-    # --------------------------------------------------------
-    # Load existing datasets
-    # --------------------------------------------------------
-
+    # Load existing datasets.
     datasets = {
         variant: load_variant(
             processed,
@@ -659,10 +636,7 @@ def train(args):
         for variant in VARIANTS
     }
 
-    # --------------------------------------------------------
-    # Configure MLflow
-    # --------------------------------------------------------
-
+    # Configure MLflow.
     configure_mlflow(
         args.experiment,
         db,
@@ -681,7 +655,7 @@ def train(args):
     )
 
     # --------------------------------------------------------
-    # Train candidates
+    # Train candidate models
     # --------------------------------------------------------
 
     for variant, data in datasets.items():
@@ -721,13 +695,9 @@ def train(args):
 
                 try:
 
-                    # ----------------------------------------
-                    # Fit using training data only
-                    # ----------------------------------------
-
+                    # Fit using training data only.
                     model = clone(prototype)
 
-                    # Capture convergence warnings.
                     with warnings.catch_warnings(
                         record=True
                     ) as caught_warnings:
@@ -751,7 +721,6 @@ def train(args):
                         )
                     ]
 
-                    # Record convergence diagnostics.
                     mlflow.log_metric(
                         "convergence_warning_count",
                         len(convergence_warnings),
@@ -776,10 +745,7 @@ def train(args):
                             convergence_warnings[0][:500],
                         )
 
-                    # ----------------------------------------
-                    # Validation predictions
-                    # ----------------------------------------
-
+                    # Validation predictions.
                     probabilities = (
                         model.predict_proba(
                             data.X_val
@@ -803,10 +769,7 @@ def train(args):
                         zero_division=0,
                     )
 
-                    # ----------------------------------------
-                    # Log validation metrics
-                    # ----------------------------------------
-
+                    # Log validation metrics.
                     mlflow.log_metrics({
                         f"val_{key}": value
                         for key, value in metrics.items()
@@ -849,15 +812,11 @@ def train(args):
                         "status": "FINISHED",
                     }
 
-                    # ----------------------------------------
-                    # Select best validation candidate
-                    # ----------------------------------------
-
+                    # Select best validation candidate.
                     if (
                         best is None
                         or rank(row) > rank(best)
                     ):
-
                         best = row
                         best_model = model
 
@@ -890,7 +849,6 @@ def train(args):
                 leaderboard.append(row)
 
         if best is None or best_model is None:
-
             raise RuntimeError(
                 f"All candidates failed for {variant}"
             )
@@ -973,6 +931,10 @@ def train(args):
         )
 
         # Verify feature names and ordering.
+        feature_names = list(
+            data.X_train.columns
+        )
+
         if hasattr(
             fitted_preprocessor,
             "get_feature_names_out",
@@ -982,25 +944,22 @@ def train(args):
                 fitted_preprocessor.get_feature_names_out()
             )
 
-            actual = list(
-                data.X_train.columns
-            )
-
-            if expected != actual:
-
+            if expected != feature_names:
                 raise ValueError(
                     "Saved preprocessor feature names "
                     f"do not match CSV columns for {variant}"
                 )
 
-        # Build deployable inference pipeline.
-        deployable = Pipeline([
-            ("preprocess", fitted_preprocessor),
-            ("classifier", classifier),
-        ])
+        # Build corrected deployable pipeline.
+        deployable = build_deployable_pipeline(
+            fitted_preprocessor=fitted_preprocessor,
+            classifier=classifier,
+            feature_names=feature_names,
+            sample_features=data.X_train,
+        )
 
         # Do not call deployable.fit().
-        # The classifier and preprocessor are already fitted.
+        # Both preprocessing and classifier are already fitted.
 
         model_path = (
             variant_dir / "model_pipeline.joblib"
@@ -1106,6 +1065,98 @@ def train(args):
         )
 
     # --------------------------------------------------------
+    # Promote overall validation winner for inference
+    # --------------------------------------------------------
+
+    # Quick runs must not overwrite a promoted full-run model.
+    if not args.quick:
+
+        best_info, _, _ = winners[preferred]
+
+        source_model = (
+            output / preferred / "model_pipeline.joblib"
+        )
+
+        source_threshold = (
+            output / preferred / "decision_threshold.json"
+        )
+
+        if (
+            not source_model.is_file()
+            or not source_threshold.is_file()
+        ):
+            raise FileNotFoundError(
+                "Winning model or threshold artifact is missing."
+            )
+
+        # Copy the exact serialized winning pipeline.
+        models_dir = output.parent
+
+        models_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        promoted_model = (
+            models_dir / "best_model_pipeline.joblib"
+        )
+
+        promoted_metadata = (
+            models_dir / "best_model_metadata.json"
+        )
+
+        shutil.copy2(
+            source_model,
+            promoted_model,
+        )
+
+        threshold_info = json.loads(
+            source_threshold.read_text(
+                encoding="utf-8"
+            )
+        )
+
+        metadata = {
+            "model_family": best_info["model"],
+            "preprocessing_variant": preferred,
+            "decision_threshold": threshold_info["threshold"],
+            "positive_class": threshold_info["positive_class"],
+            "validation_f1": best_info["val_f1"],
+            "validation_pr_auc": best_info["val_pr_auc"],
+            "validation_roc_auc": best_info["val_roc_auc"],
+            "mlflow_run_id": best_info["run_id"],
+            "source_model_path": str(source_model),
+            "model_filename": promoted_model.name,
+            "model_sha256": file_sha256(promoted_model),
+        }
+
+        promoted_metadata.write_text(
+            json.dumps(
+                metadata,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        summary["promoted_model"] = str(
+            promoted_model
+        )
+
+        summary["promoted_metadata"] = str(
+            promoted_metadata
+        )
+
+        LOG.info(
+            "Promoted best model: %s",
+            promoted_model,
+        )
+
+        LOG.info(
+            "Promoted model metadata: %s",
+            promoted_metadata,
+        )
+
+    # --------------------------------------------------------
     # Save training summary
     # --------------------------------------------------------
 
@@ -1135,7 +1186,7 @@ def train(args):
 
 
 # ============================================================
-# 11. Command-line arguments
+# 12. Command-line arguments
 # ============================================================
 
 def parse_args():
@@ -1197,7 +1248,7 @@ def parse_args():
 
 
 # ============================================================
-# 12. Entry point
+# 13. Entry point
 # ============================================================
 
 def main():

@@ -514,10 +514,9 @@ def test_multiple_target_columns_are_rejected(
 
     with pytest.raises(
         ValueError,
-        match="Expected one target column",
+        match="Expected exactly one target column",
     ):
         load(training_workspace)
-
 
 def test_feature_order_mismatch_is_rejected(
     training_workspace,
@@ -1061,8 +1060,10 @@ def test_saved_pipeline_predicts_raw_inputs(
         Pipeline,
     )
 
+    # Verify the updated three-stage inference pipeline.
     assert list(model.named_steps) == [
         "preprocess",
+        "feature_names",
         "classifier",
     ]
 
@@ -1083,7 +1084,6 @@ def test_saved_pipeline_predicts_raw_inputs(
         probabilities.sum(axis=1),
         1.0,
     )
-
 
 def test_saved_pipeline_matches_processed_predictions(
     training_workspace,

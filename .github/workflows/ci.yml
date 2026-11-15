@@ -1,21 +1,36 @@
-name: Python Unit Tests
-runs-on: ubuntu-latest
 
-steps:
-  - names: Checkout repository
-    uses: actions/checkout@v4
+name: MLOps CI
 
-  - name: Set up Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.11"
-      cache: pip
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
-  - name: Install dependencies
-    run: |
-      python -m pip install --upgrade pip
-      python -m pip install -r requirements.txt
-  
-  - name: Run unit tests
-    run: |
-      python -m pytest tests/ -v
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/ -v

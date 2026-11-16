@@ -1,32 +1,34 @@
 
 """
-Sprint 17 - Unit Tests for Model Robustness Evaluation
+Sprint 17 - MLOps Final Project
+Tests: tests/test_robustness.py
 
-Tests:
-    - Model and metadata loading
-    - Target validation
-    - Dataset loading and validation
-    - Classification metrics
-    - Fixed decision threshold
-    - Performance degradation
-    - Four-scenario robustness evaluation
-    - CLI parsing and main workflow
+Tests for src/models/robustness.py.
 
-All test artifacts are temporary.
-No production datasets or models are modified.
+Architecture:
+    models/reference/
+        best_model_pipeline.joblib
+        best_model_metadata.json
+
+    models/runs/<execution_id>/
+        Isolated training executions
+
+These tests use temporary artifacts and synthetic datasets.
+
+Run:
+    python -m pytest tests/test_robustness.py -v
 """
 
+from argparse import Namespace
 import json
-import sys
-
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import joblib
 import numpy as np
 import pandas as pd
 import pytest
 
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     average_precision_score,
@@ -44,40 +46,30 @@ from src.models import robustness
 # 1. Fixtures
 # ============================================================
 
-class MockClassifier:
-    """
-    Deterministic binary classifier for robustness tests.
-
-    Uses the 'score' feature as the positive-class probability.
-    No training is required.
-    """
-
-    def __init__(self):
-        self.classes_ = np.array([0, 1])
-        self.feature_names_in_ = np.array(["score"])
-
-    def predict_proba(self, X):
-        scores = X["score"].to_numpy(dtype=float)
-
-        return np.column_stack([
-            1.0 - scores,
-            scores,
-        ])
-
-
 @pytest.fixture
-def model():
-    return MockClassifier()
+def synthetic_data():
+    """
+    Create deterministic binary classification data.
 
+    The target is based on a combination of two features.
+    """
 
-@pytest.fixture
-def sample_data():
+    rng = np.random.default_rng(42)
+
     X = pd.DataFrame({
-        "score": [0.1, 0.8, 0.4, 0.9, 0.3, 0.7],
+        "age": rng.integers(20, 65, size=120),
+        "hours_per_week": rng.integers(
+            20, 60, size=120
+        ),
     })
 
+    signal = (
+        0.12 * X["age"]
+        + 0.15 * X["hours_per_week"]
+    )
+
     y = pd.Series(
-        [0, 1, 0, 1, 1, 0],
+        (signal > signal.median()).astype(int),
         name="income",
     )
 
@@ -85,137 +77,404 @@ def sample_data():
 
 
 @pytest.fixture
-def metadata():
-    return {
-        "decision_threshold": 0.5,
-        "positive_class": 1,
+def trained_model(synthetic_data):
+    """Train a small classifier for isolated tests."""
+
+    X, y = synthetic_data
+
+    model = LogisticRegression(
+        max_iter=1000,
+        random_state=42,
+    )
+
+    model.fit(X, y)
+
+    return model
+
+
+@pytest.fixture
+def reference_artifacts(
+    tmp_path,
+    trained_model,
+):
+    """
+    Create temporary reference model artifacts.
+
+    No files in the project's models/reference directory
+    are accessed or modified.
+    """
+
+    reference_dir = (
+        tmp_path / "models" / "reference"
+    )
+    reference_dir.mkdir(parents=True)
+
+    model_path = (
+        reference_dir / "best_model_pipeline.joblib"
+    )
+    metadata_path = (
+        reference_dir / "best_model_metadata.json"
+    )
+
+    joblib.dump(trained_model, model_path)
+
+    metadata = {
+        "model_family": "logistic_regression",
         "preprocessing_variant": "baseline",
-        "model_family": "hist_gradient_boosting",
+        "decision_threshold": 0.40,
+        "model_sha256": robustness.file_sha256(
+            model_path
+        ),
+    }
+
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
+
+    return {
+        "directory": reference_dir,
+        "model_path": model_path,
+        "metadata_path": metadata_path,
+        "metadata": metadata,
     }
 
 
 @pytest.fixture
-def model_files(tmp_path, model, metadata):
-    model_path = tmp_path / "model.joblib"
-    metadata_path = tmp_path / "metadata.json"
+def scenario_datasets(
+    tmp_path,
+    synthetic_data,
+):
+    """
+    Generate four labeled evaluation datasets.
 
-    joblib.dump(model, model_path)
+    All scenarios contain the same number of rows.
+    The feature distributions differ across scenarios.
+    """
+
+    X, y = synthetic_data
+
+    drift_dir = tmp_path / "data" / "drift"
+
+    rng = np.random.default_rng(123)
+
+    shifts = {
+        "control": 0,
+        "mild": 2,
+        "moderate": 6,
+        "severe": 12,
+    }
+
+    paths = {}
+
+    for scenario, shift in shifts.items():
+        scenario_dir = drift_dir / scenario
+        scenario_dir.mkdir(parents=True)
+
+        X_current = X.copy()
+
+        if shift:
+            X_current["age"] = (
+                X_current["age"]
+                + rng.integers(
+                    -shift,
+                    shift + 1,
+                    size=len(X_current),
+                )
+            )
+
+        features_path = (
+            scenario_dir / "X_test.csv"
+        )
+        target_path = (
+            scenario_dir / "y_test.csv"
+        )
+
+        X_current.to_csv(
+            features_path,
+            index=False,
+        )
+
+        y.to_frame().to_csv(
+            target_path,
+            index=False,
+        )
+
+        paths[scenario] = (
+            features_path,
+            target_path,
+        )
+
+    return paths
+
+
+@pytest.fixture
+def robustness_args(
+    tmp_path,
+    reference_artifacts,
+    scenario_datasets,
+):
+    """Build command-line arguments for orchestration."""
+
+    args = {
+        "model": reference_artifacts["model_path"],
+        "metadata": reference_artifacts[
+            "metadata_path"
+        ],
+        "output_dir": (
+            tmp_path / "reports" / "robustness"
+        ),
+    }
+
+    for scenario in robustness.SCENARIOS:
+        features, target = scenario_datasets[
+            scenario
+        ]
+
+        args[scenario] = features
+        args[f"{scenario}_target"] = target
+
+    return Namespace(**args)
+
+
+# ============================================================
+# 2. Configuration
+# ============================================================
+
+def test_default_model_paths_use_reference():
+    """Default artifacts must come from models/reference."""
+
+    assert robustness.DEFAULT_MODEL == (
+        robustness.ROOT
+        / "models"
+        / "reference"
+        / "best_model_pipeline.joblib"
+    )
+
+    assert robustness.DEFAULT_METADATA == (
+        robustness.ROOT
+        / "models"
+        / "reference"
+        / "best_model_metadata.json"
+    )
+
+
+def test_scenario_configuration():
+    """All required scenarios must be configured."""
+
+    assert robustness.SCENARIOS == (
+        "control",
+        "mild",
+        "moderate",
+        "severe",
+    )
+
+
+# ============================================================
+# 3. SHA-256 integrity
+# ============================================================
+
+def test_file_sha256_matches_hashlib(tmp_path):
+    """File fingerprint must match the standard SHA-256."""
+
+    import hashlib
+
+    path = tmp_path / "sample.bin"
+    content = b"Sprint 17 robustness test"
+
+    path.write_bytes(content)
+
+    expected = hashlib.sha256(
+        content
+    ).hexdigest()
+
+    assert robustness.file_sha256(path) == expected
+
+
+def test_file_sha256_detects_changes(tmp_path):
+    """Changing a file must change its fingerprint."""
+
+    path = tmp_path / "sample.bin"
+
+    path.write_bytes(b"original")
+    original_hash = robustness.file_sha256(path)
+
+    path.write_bytes(b"modified")
+    modified_hash = robustness.file_sha256(path)
+
+    assert original_hash != modified_hash
+
+
+# ============================================================
+# 4. Reference model loading
+# ============================================================
+
+def test_load_reference_model(
+    reference_artifacts,
+):
+    """Load a valid model, metadata, and threshold."""
+
+    model, metadata, threshold = (
+        robustness.load_reference_model(
+            reference_artifacts["model_path"],
+            reference_artifacts["metadata_path"],
+        )
+    )
+
+    assert callable(model.predict_proba)
+    assert threshold == pytest.approx(0.40)
+    assert metadata["preprocessing_variant"] == (
+        "baseline"
+    )
+
+
+def test_load_reference_preserves_files(
+    reference_artifacts,
+):
+    """Loading must not modify reference artifacts."""
+
+    model_path = reference_artifacts["model_path"]
+    metadata_path = reference_artifacts[
+        "metadata_path"
+    ]
+
+    before = {
+        "model": robustness.file_sha256(model_path),
+        "metadata": robustness.file_sha256(
+            metadata_path
+        ),
+    }
+
+    robustness.load_reference_model(
+        model_path,
+        metadata_path,
+    )
+
+    after = {
+        "model": robustness.file_sha256(model_path),
+        "metadata": robustness.file_sha256(
+            metadata_path
+        ),
+    }
+
+    assert before == after
+
+
+def test_missing_reference_model(
+    tmp_path,
+    reference_artifacts,
+):
+    """Missing model files must be rejected."""
+
+    missing_model = tmp_path / "missing.joblib"
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="Reference model not found",
+    ):
+        robustness.load_reference_model(
+            missing_model,
+            reference_artifacts["metadata_path"],
+        )
+
+
+def test_missing_reference_metadata(
+    tmp_path,
+    reference_artifacts,
+):
+    """Missing metadata files must be rejected."""
+
+    missing_metadata = tmp_path / "missing.json"
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="Reference metadata not found",
+    ):
+        robustness.load_reference_model(
+            reference_artifacts["model_path"],
+            missing_metadata,
+        )
+
+
+def test_reference_model_hash_mismatch(
+    reference_artifacts,
+):
+    """A model with an incorrect hash must be rejected."""
+
+    metadata_path = reference_artifacts[
+        "metadata_path"
+    ]
+
+    metadata = reference_artifacts[
+        "metadata"
+    ].copy()
+
+    metadata["model_sha256"] = "0" * 64
 
     metadata_path.write_text(
         json.dumps(metadata),
         encoding="utf-8",
     )
 
-    return model_path, metadata_path
-
-
-@pytest.fixture
-def dataset_files(tmp_path, sample_data):
-    X, y = sample_data
-
-    features_path = tmp_path / "X_test.csv"
-    target_path = tmp_path / "y_test.csv"
-
-    X.to_csv(features_path, index=False)
-    y.to_frame().to_csv(target_path, index=False)
-
-    return features_path, target_path
-
-
-@pytest.fixture
-def scenario_paths(tmp_path):
-    """
-    Create four labeled scenarios with identical row counts
-    and controlled feature perturbations.
-    """
-
-    scores = {
-        "control": [0.1, 0.8, 0.4, 0.9],
-        "mild": [0.2, 0.75, 0.45, 0.85],
-        "moderate": [0.4, 0.6, 0.55, 0.7],
-        "severe": [0.8, 0.2, 0.9, 0.1],
-    }
-
-    targets = [0, 1, 0, 1]
-
-    paths = {}
-
-    for scenario, values in scores.items():
-        directory = tmp_path / scenario
-        directory.mkdir()
-
-        features_path = directory / "X_test.csv"
-        target_path = directory / "y_test.csv"
-
-        pd.DataFrame({
-            "score": values,
-        }).to_csv(features_path, index=False)
-
-        pd.DataFrame({
-            "income": targets,
-        }).to_csv(target_path, index=False)
-
-        paths[scenario] = {
-            "features": features_path,
-            "target": target_path,
-        }
-
-    return paths
-
-
-# ============================================================
-# 2. Model Loading
-# ============================================================
-
-def test_load_model_success(model_files):
-    model_path, metadata_path = model_files
-
-    loaded_model, loaded_metadata = robustness.load_model(
-        model_path,
-        metadata_path,
-    )
-
-    assert isinstance(loaded_model, MockClassifier)
-    assert loaded_metadata["decision_threshold"] == 0.5
-    assert loaded_metadata["positive_class"] == 1
-
-
-def test_load_model_missing_file(tmp_path):
     with pytest.raises(
-        FileNotFoundError,
-        match="Model not found",
+        ValueError,
+        match="SHA-256 mismatch",
     ):
-        robustness.load_model(
-            tmp_path / "missing.joblib",
-            tmp_path / "metadata.json",
+        robustness.load_reference_model(
+            reference_artifacts["model_path"],
+            metadata_path,
         )
 
 
-def test_load_model_missing_metadata(model_files, tmp_path):
-    model_path, _ = model_files
+def test_missing_decision_threshold(
+    reference_artifacts,
+):
+    """Reference metadata must define a threshold."""
+
+    metadata = reference_artifacts[
+        "metadata"
+    ].copy()
+
+    metadata.pop("decision_threshold")
+
+    metadata_path = reference_artifacts[
+        "metadata_path"
+    ]
+
+    metadata_path.write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
 
     with pytest.raises(
-        FileNotFoundError,
-        match="Model metadata not found",
+        ValueError,
+        match="decision_threshold",
     ):
-        robustness.load_model(
-            model_path,
-            tmp_path / "missing.json",
+        robustness.load_reference_model(
+            reference_artifacts["model_path"],
+            metadata_path,
         )
 
 
 @pytest.mark.parametrize(
-    "invalid_threshold",
-    [-0.1, 1.1, np.nan, np.inf, -np.inf],
+    "threshold",
+    [-0.1, 1.1, float("nan"), float("inf")],
 )
-def test_load_model_rejects_invalid_threshold(
-    model_files,
-    metadata,
-    invalid_threshold,
+def test_invalid_decision_threshold(
+    reference_artifacts,
+    threshold,
 ):
-    model_path, metadata_path = model_files
+    """Thresholds must be finite and within [0, 1]."""
 
-    metadata["decision_threshold"] = invalid_threshold
+    metadata = reference_artifacts[
+        "metadata"
+    ].copy()
+
+    metadata["decision_threshold"] = threshold
+
+    metadata_path = reference_artifacts[
+        "metadata_path"
+    ]
 
     metadata_path.write_text(
         json.dumps(metadata),
@@ -226,106 +485,28 @@ def test_load_model_rejects_invalid_threshold(
         ValueError,
         match="Invalid decision threshold",
     ):
-        robustness.load_model(
-            model_path,
+        robustness.load_reference_model(
+            reference_artifacts["model_path"],
             metadata_path,
         )
 
 
-def test_load_model_rejects_wrong_positive_class(
-    model_files,
-    metadata,
-):
-    model_path, metadata_path = model_files
-
-    metadata["positive_class"] = 0
-
-    metadata_path.write_text(
-        json.dumps(metadata),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="Expected positive class 1",
-    ):
-        robustness.load_model(
-            model_path,
-            metadata_path,
-        )
-
-
-
-def test_load_model_rejects_missing_predict_proba(
-    monkeypatch,
-    model_files,
-):
-    model_path, metadata_path = model_files
-
-    # Create an object with classes_ but no predict_proba().
-    class InvalidModel:
-        classes_ = np.array([0, 1])
-
-    invalid_model = InvalidModel()
-
-    # Replace deserialization with the invalid model.
-    monkeypatch.setattr(
-        robustness.joblib,
-        "load",
-        lambda path: invalid_model,
-    )
-
-    with pytest.raises(
-        TypeError,
-        match="Model must implement predict_proba",
-    ):
-        robustness.load_model(
-            model_path,
-            metadata_path,
-        )
-
-
-def test_load_model_rejects_missing_classes(
-    monkeypatch,
-    model_files,
-):
-    model_path, metadata_path = model_files
-
-    # Simulate a model that implements predict_proba()
-    # but does not expose fitted classes_.
-    class InvalidModel:
-        def predict_proba(self, X):
-            return np.zeros((len(X), 2))
-
-    invalid_model = InvalidModel()
-
-    # Return the invalid model without serializing it.
-    monkeypatch.setattr(
-        robustness.joblib,
-        "load",
-        lambda path: invalid_model,
-    )
-
-    with pytest.raises(
-        TypeError,
-        match="Model must expose fitted classes_",
-    ):
-        robustness.load_model(
-            model_path,
-            metadata_path,
-        )
-
-def test_load_model_rejects_wrong_classes(
+def test_model_without_predict_proba(
     tmp_path,
-    metadata,
 ):
-    model_path = tmp_path / "model.joblib"
+    """Models without predict_proba must be rejected."""
+
+    model_path = tmp_path / "invalid.joblib"
     metadata_path = tmp_path / "metadata.json"
 
-    invalid_model = MockClassifier()
-    invalid_model.classes_ = np.array([1, 2])
+    joblib.dump({"not": "a classifier"}, model_path)
 
-    joblib.dump(invalid_model, model_path)
+    metadata = {
+        "decision_threshold": 0.5,
+        "model_sha256": robustness.file_sha256(
+            model_path
+        ),
+    }
 
     metadata_path.write_text(
         json.dumps(metadata),
@@ -333,404 +514,423 @@ def test_load_model_rejects_wrong_classes(
     )
 
     with pytest.raises(
-        ValueError,
-        match="Unexpected model classes",
+        TypeError,
+        match="predict_proba",
     ):
-        robustness.load_model(
+        robustness.load_reference_model(
             model_path,
             metadata_path,
         )
 
 
 # ============================================================
-# 3. Target Validation
+# 5. Dataset loading
 # ============================================================
 
-@pytest.mark.parametrize(
-    "values, expected",
-    [
-        ([0, 1, 0], [0, 1, 0]),
-        (["0", "1", "0"], [0, 1, 0]),
-        (["<=50K", ">50K"], [0, 1]),
-        ([" <=50K ", " >50K. "], [0, 1]),
-    ],
-)
-def test_validate_target_valid_labels(values, expected):
-    result = robustness.validate_target(
-        pd.Series(values)
-    )
+def test_load_dataset(
+    scenario_datasets,
+):
+    """Load a valid labeled evaluation dataset."""
 
-    assert result.tolist() == expected
-    assert pd.api.types.is_integer_dtype(result)
-
-
-@pytest.mark.parametrize(
-    "values",
-    [
-        ["unknown", ">50K"],
-        ["<=50K", None],
-        [0, 2],
-        [-1, 1],
-        [0, np.nan],
-    ],
-)
-def test_validate_target_rejects_invalid_labels(values):
-    with pytest.raises(ValueError):
-        robustness.validate_target(
-            pd.Series(values)
-        )
-
-
-def test_validate_target_does_not_modify_input():
-    original = pd.Series(
-        ["<=50K", ">50K."],
-        name="income",
-    )
-
-    original_copy = original.copy(deep=True)
-
-    robustness.validate_target(original)
-
-    pd.testing.assert_series_equal(
-        original,
-        original_copy,
-    )
-
-
-# ============================================================
-# 4. Dataset Loading
-# ============================================================
-
-def test_load_dataset_separate_files(dataset_files, sample_data):
-    features_path, target_path = dataset_files
-    expected_X, expected_y = sample_data
+    features, target = scenario_datasets[
+        "control"
+    ]
 
     X, y = robustness.load_dataset(
-        features_path,
-        target_path,
+        features,
+        target,
     )
 
-    pd.testing.assert_frame_equal(
-        X,
-        expected_X,
-    )
-
-    pd.testing.assert_series_equal(
-        y,
-        expected_y,
-    )
+    assert len(X) == len(y)
+    assert X.shape[1] == 2
+    assert set(y.unique()) == {0, 1}
+    assert pd.api.types.is_integer_dtype(y)
 
 
-def test_load_dataset_combined_file(tmp_path, sample_data):
-    X, y = sample_data
+def test_missing_feature_dataset(
+    tmp_path,
+    scenario_datasets,
+):
+    """Missing feature files must be rejected."""
 
-    combined = X.copy()
-    combined["income"] = y
-
-    path = tmp_path / "combined.csv"
-    combined.to_csv(path, index=False)
-
-    loaded_X, loaded_y = robustness.load_dataset(path)
-
-    pd.testing.assert_frame_equal(
-        loaded_X,
-        X,
-    )
-
-    pd.testing.assert_series_equal(
-        loaded_y,
-        y,
-    )
-
-
-def test_load_dataset_missing_features(tmp_path):
-    with pytest.raises(
-        FileNotFoundError,
-        match="Features file not found",
-    ):
-        robustness.load_dataset(
-            tmp_path / "missing.csv"
-        )
-
-
-def test_load_dataset_missing_target(dataset_files, tmp_path):
-    features_path, _ = dataset_files
+    _, target = scenario_datasets["control"]
 
     with pytest.raises(
         FileNotFoundError,
-        match="Target file not found",
+        match="Feature dataset not found",
     ):
         robustness.load_dataset(
-            features_path,
-            tmp_path / "missing_target.csv",
+            tmp_path / "missing.csv",
+            target,
         )
 
 
-def test_load_dataset_rejects_empty_file(tmp_path):
-    path = tmp_path / "empty.csv"
-
-    pd.DataFrame({
-        "score": pd.Series(dtype=float),
-        "income": pd.Series(dtype=int),
-    }).to_csv(path, index=False)
-
-    with pytest.raises(
-        ValueError,
-        match="Empty dataset",
-    ):
-        robustness.load_dataset(path)
-
-
-def test_load_dataset_rejects_missing_target_column(
-    dataset_files,
-):
-    features_path, _ = dataset_files
-
-    with pytest.raises(
-        ValueError,
-        match="Target 'income' missing",
-    ):
-        robustness.load_dataset(features_path)
-
-
-def test_load_dataset_rejects_duplicate_target(
+def test_missing_target_dataset(
     tmp_path,
-    sample_data,
+    scenario_datasets,
 ):
-    X, y = sample_data
+    """Missing target files must be rejected."""
 
-    combined = X.copy()
-    combined["income"] = y
-
-    features_path = tmp_path / "features.csv"
-    target_path = tmp_path / "target.csv"
-
-    combined.to_csv(features_path, index=False)
-    y.to_frame().to_csv(target_path, index=False)
+    features, _ = scenario_datasets["control"]
 
     with pytest.raises(
-        ValueError,
-        match="already contains the target",
+        FileNotFoundError,
+        match="Target dataset not found",
     ):
         robustness.load_dataset(
-            features_path,
-            target_path,
+            features,
+            tmp_path / "missing.csv",
         )
 
 
-def test_load_dataset_rejects_multiple_target_columns(
+def test_feature_target_row_mismatch(
     tmp_path,
-    sample_data,
+    synthetic_data,
 ):
-    X, y = sample_data
+    """Feature and target row counts must match."""
 
-    features_path = tmp_path / "features.csv"
-    target_path = tmp_path / "target.csv"
+    X, y = synthetic_data
 
-    X.to_csv(features_path, index=False)
+    features = tmp_path / "X.csv"
+    target = tmp_path / "y.csv"
+
+    X.to_csv(features, index=False)
+    y.iloc[:-1].to_frame().to_csv(
+        target, index=False
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="row counts",
+    ):
+        robustness.load_dataset(
+            features,
+            target,
+        )
+
+
+def test_multiple_target_columns_rejected(
+    tmp_path,
+    synthetic_data,
+):
+    """Target files must contain exactly one column."""
+
+    X, y = synthetic_data
+
+    features = tmp_path / "X.csv"
+    target = tmp_path / "y.csv"
+
+    X.to_csv(features, index=False)
 
     pd.DataFrame({
         "income": y,
         "extra": y,
-    }).to_csv(target_path, index=False)
+    }).to_csv(target, index=False)
 
     with pytest.raises(
         ValueError,
         match="exactly one column",
     ):
         robustness.load_dataset(
-            features_path,
-            target_path,
+            features,
+            target,
         )
 
 
-def test_load_dataset_rejects_mismatched_rows(
+def test_invalid_target_labels_rejected(
     tmp_path,
-    sample_data,
+    synthetic_data,
 ):
-    X, y = sample_data
+    """Only binary 0/1 target labels are accepted."""
 
-    features_path = tmp_path / "features.csv"
-    target_path = tmp_path / "target.csv"
+    X, y = synthetic_data
 
-    X.to_csv(features_path, index=False)
-    y.iloc[:-1].to_frame().to_csv(
-        target_path,
-        index=False,
+    features = tmp_path / "X.csv"
+    target = tmp_path / "y.csv"
+
+    X.to_csv(features, index=False)
+
+    invalid_y = y.copy()
+    invalid_y.iloc[0] = 2
+
+    invalid_y.to_frame().to_csv(
+        target, index=False
     )
 
     with pytest.raises(
         ValueError,
-        match="row counts do not match",
+        match="binary labels",
     ):
         robustness.load_dataset(
-            features_path,
-            target_path,
+            features,
+            target,
         )
 
 
-def test_load_dataset_rejects_no_features(tmp_path):
-    path = tmp_path / "target_only.csv"
+def test_single_class_target_rejected(
+    tmp_path,
+    synthetic_data,
+):
+    """Both target classes are required for ROC-AUC."""
+
+    X, _ = synthetic_data
+
+    features = tmp_path / "X.csv"
+    target = tmp_path / "y.csv"
+
+    X.to_csv(features, index=False)
 
     pd.DataFrame({
-        "income": [0, 1, 0],
-    }).to_csv(path, index=False)
+        "income": np.zeros(
+            len(X), dtype=int
+        ),
+    }).to_csv(target, index=False)
 
     with pytest.raises(
         ValueError,
-        match="no feature columns",
+        match="both classes",
     ):
-        robustness.load_dataset(path)
+        robustness.load_dataset(
+            features,
+            target,
+        )
 
 
-def test_load_dataset_preserves_row_order(
+def test_missing_target_values_rejected(
     tmp_path,
+    synthetic_data,
 ):
-    X = pd.DataFrame({
-        "score": [0.9, 0.1, 0.7, 0.2],
-    })
+    """Missing target labels must be rejected."""
 
-    y = pd.Series(
-        [1, 0, 1, 0],
-        name="income",
+    X, y = synthetic_data
+
+    features = tmp_path / "X.csv"
+    target = tmp_path / "y.csv"
+
+    X.to_csv(features, index=False)
+
+    invalid_y = y.astype(float).copy()
+    invalid_y.iloc[0] = np.nan
+
+    invalid_y.to_frame().to_csv(
+        target, index=False
     )
 
-    features_path = tmp_path / "features.csv"
-    target_path = tmp_path / "target.csv"
-
-    X.to_csv(features_path, index=False)
-    y.to_frame().to_csv(target_path, index=False)
-
-    loaded_X, loaded_y = robustness.load_dataset(
-        features_path,
-        target_path,
-    )
-
-    assert loaded_X["score"].tolist() == [
-        0.9, 0.1, 0.7, 0.2
-    ]
-
-    assert loaded_y.tolist() == [1, 0, 1, 0]
-
-
-def test_load_dataset_does_not_modify_files(dataset_files):
-    features_path, target_path = dataset_files
-
-    features_before = features_path.read_bytes()
-    target_before = target_path.read_bytes()
-
-    robustness.load_dataset(
-        features_path,
-        target_path,
-    )
-
-    assert features_path.read_bytes() == features_before
-    assert target_path.read_bytes() == target_before
+    with pytest.raises(
+        ValueError,
+        match="missing values",
+    ):
+        robustness.load_dataset(
+            features,
+            target,
+        )
 
 
 # ============================================================
-# 5. Classification Metrics
+# 6. Model evaluation
 # ============================================================
 
-def test_evaluate_model_correct_metrics(model, sample_data):
-    X, y = sample_data
+def test_evaluate_model_returns_metrics(
+    trained_model,
+    synthetic_data,
+):
+    """Evaluation must return all required metrics."""
 
-    result = robustness.evaluate_model(
-        model,
+    X, y = synthetic_data
+
+    metrics = robustness.evaluate_model(
+        trained_model,
         X,
         y,
-        threshold=0.5,
+        threshold=0.40,
     )
 
-    probabilities = X["score"].to_numpy()
-    predictions = (probabilities >= 0.5).astype(int)
+    expected = {
+        "rows",
+        "accuracy",
+        "balanced_accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "roc_auc",
+        "pr_auc",
+        "confusion_matrix",
+    }
 
-    assert result["n_samples"] == len(y)
+    assert set(metrics) == expected
+    assert metrics["rows"] == len(y)
 
-    assert result["accuracy"] == pytest.approx(
-        accuracy_score(y, predictions)
+    for metric in expected - {
+        "rows", "confusion_matrix"
+    }:
+        assert 0 <= metrics[metric] <= 1
+
+
+def test_evaluation_uses_saved_threshold(
+    trained_model,
+    synthetic_data,
+):
+    """Predictions must use the supplied threshold."""
+
+    X, y = synthetic_data
+
+    threshold = 0.40
+
+    probabilities = trained_model.predict_proba(X)
+
+    positive_index = np.flatnonzero(
+        trained_model.classes_ == 1
+    )[0]
+
+    positive_probabilities = probabilities[
+        :, positive_index
+    ]
+
+    predictions = (
+        positive_probabilities >= threshold
+    ).astype(int)
+
+    metrics = robustness.evaluate_model(
+        trained_model,
+        X,
+        y,
+        threshold,
     )
 
-    assert result["balanced_accuracy"] == pytest.approx(
-        balanced_accuracy_score(y, predictions)
-    )
-
-    assert result["precision"] == pytest.approx(
-        precision_score(y, predictions)
-    )
-
-    assert result["recall"] == pytest.approx(
-        recall_score(y, predictions)
-    )
-
-    assert result["f1"] == pytest.approx(
+    assert metrics["f1"] == pytest.approx(
         f1_score(y, predictions)
     )
 
-    assert result["roc_auc"] == pytest.approx(
+    assert metrics["precision"] == pytest.approx(
+        precision_score(
+            y, predictions, zero_division=0
+        )
+    )
+
+    assert metrics["recall"] == pytest.approx(
+        recall_score(
+            y, predictions, zero_division=0
+        )
+    )
+
+
+def test_evaluation_matches_sklearn(
+    trained_model,
+    synthetic_data,
+):
+    """Metrics must match independent sklearn calculations."""
+
+    X, y = synthetic_data
+
+    threshold = 0.40
+
+    probabilities = trained_model.predict_proba(X)[:, 1]
+
+    predictions = (
+        probabilities >= threshold
+    ).astype(int)
+
+    metrics = robustness.evaluate_model(
+        trained_model,
+        X,
+        y,
+        threshold,
+    )
+
+    assert metrics["accuracy"] == pytest.approx(
+        accuracy_score(y, predictions)
+    )
+
+    assert metrics[
+        "balanced_accuracy"
+    ] == pytest.approx(
+        balanced_accuracy_score(y, predictions)
+    )
+
+    assert metrics["roc_auc"] == pytest.approx(
         roc_auc_score(y, probabilities)
     )
 
-    assert result["pr_auc"] == pytest.approx(
+    assert metrics["pr_auc"] == pytest.approx(
         average_precision_score(y, probabilities)
     )
 
 
-def test_evaluate_model_confusion_matrix(model, sample_data):
-    X, y = sample_data
+def test_evaluation_confusion_matrix(
+    trained_model,
+    synthetic_data,
+):
+    """Confusion matrix must contain all observations."""
 
-    result = robustness.evaluate_model(
-        model,
+    X, y = synthetic_data
+
+    metrics = robustness.evaluate_model(
+        trained_model,
         X,
         y,
-        threshold=0.5,
+        threshold=0.40,
     )
 
-    assert result["tn"] == 2
-    assert result["fp"] == 1
-    assert result["fn"] == 1
-    assert result["tp"] == 2
+    matrix = metrics["confusion_matrix"]
+
+    assert len(matrix) == 2
+    assert all(len(row) == 2 for row in matrix)
 
     assert sum(
-        result[key]
-        for key in ("tn", "fp", "fn", "tp")
+        sum(row) for row in matrix
     ) == len(y)
 
 
-def test_evaluate_model_uses_fixed_threshold(
-    model,
-    sample_data,
+def test_threshold_changes_predictions(
+    trained_model,
+    synthetic_data,
 ):
-    X, y = sample_data
+    """Different thresholds should affect classification."""
 
-    low_threshold = robustness.evaluate_model(
-        model,
+    X, y = synthetic_data
+
+    low = robustness.evaluate_model(
+        trained_model,
         X,
         y,
-        threshold=0.3,
+        threshold=0.10,
     )
 
-    high_threshold = robustness.evaluate_model(
-        model,
+    high = robustness.evaluate_model(
+        trained_model,
         X,
         y,
-        threshold=0.8,
+        threshold=0.90,
     )
 
-    assert low_threshold["tp"] > high_threshold["tp"]
-    assert low_threshold["fp"] > high_threshold["fp"]
+    assert (
+        low["confusion_matrix"]
+        != high["confusion_matrix"]
+    )
 
 
-def test_evaluate_model_rejects_empty_data(model):
-    X = pd.DataFrame({
-        "score": [],
-    })
+def test_evaluation_rejects_missing_classes(
+    trained_model,
+    synthetic_data,
+):
+    """The classifier must expose its class labels."""
 
-    y = pd.Series(dtype=int)
+    X, y = synthetic_data
+
+    class MissingClassesModel:
+        def __init__(self, original):
+            self.original = original
+
+        def predict_proba(self, features):
+            return self.original.predict_proba(
+                features
+            )
+
+    model = MissingClassesModel(trained_model)
 
     with pytest.raises(
         ValueError,
-        match="Empty or misaligned",
+        match="classes_",
     ):
         robustness.evaluate_model(
             model,
@@ -740,402 +940,372 @@ def test_evaluate_model_rejects_empty_data(model):
         )
 
 
-def test_evaluate_model_rejects_misaligned_data(
-    model,
-    sample_data,
+def test_evaluation_rejects_nonfinite_probabilities(
+    synthetic_data,
 ):
-    X, y = sample_data
+    """NaN probabilities must not produce metrics."""
 
-    with pytest.raises(
-        ValueError,
-        match="Empty or misaligned",
-    ):
-        robustness.evaluate_model(
-            model,
-            X,
-            y.iloc[:-1],
-            threshold=0.5,
-        )
+    X, y = synthetic_data
 
+    class InvalidProbabilityModel:
+        classes_ = np.array([0, 1])
 
-def test_evaluate_model_rejects_wrong_feature_schema(
-    model,
-    sample_data,
-):
-    X, y = sample_data
-
-    X = X.rename(columns={
-        "score": "wrong_name",
-    })
-
-    with pytest.raises(
-        ValueError,
-        match="expected feature names and ordering",
-    ):
-        robustness.evaluate_model(
-            model,
-            X,
-            y,
-            threshold=0.5,
-        )
-
-
-def test_evaluate_model_rejects_nonfinite_probabilities(
-    model,
-    sample_data,
-):
-    X, y = sample_data
-
-    X = X.copy()
-    X.loc[0, "score"] = np.nan
+        def predict_proba(self, features):
+            return np.full(
+                (len(features), 2),
+                np.nan,
+            )
 
     with pytest.raises(
         ValueError,
         match="non-finite probabilities",
     ):
         robustness.evaluate_model(
-            model,
+            InvalidProbabilityModel(),
             X,
             y,
             threshold=0.5,
         )
 
 
-@pytest.mark.parametrize(
-    "target_value",
-    [0, 1],
-)
-def test_evaluate_model_single_class(
-    model,
-    sample_data,
-    target_value,
+# ============================================================
+# 7. Robustness comparison
+# ============================================================
+
+@pytest.fixture
+def example_results():
+    """Provide controlled metrics for comparison tests."""
+
+    def metrics(f1, accuracy):
+        return {
+            "rows": 100,
+            "accuracy": accuracy,
+            "balanced_accuracy": accuracy,
+            "precision": f1,
+            "recall": f1,
+            "f1": f1,
+            "roc_auc": accuracy,
+            "pr_auc": accuracy,
+            "confusion_matrix": [
+                [40, 10],
+                [10, 40],
+            ],
+        }
+
+    return {
+        "control": metrics(0.80, 0.90),
+        "mild": metrics(0.78, 0.89),
+        "moderate": metrics(0.70, 0.85),
+        "severe": metrics(0.50, 0.75),
+    }
+
+
+def test_compare_to_control(
+    example_results,
 ):
-    X, _ = sample_data
+    """Metric deltas must be relative to control."""
 
-    y = pd.Series(
-        [target_value] * len(X)
+    comparison = robustness.compare_to_control(
+        example_results
     )
 
-    with pytest.warns(
-        UserWarning,
-        match="y_pred contains classes not in y_true",
-    ):
-        result = robustness.evaluate_model(
-            model,
-            X,
-            y,
-            threshold=0.5,
-        )
+    assert comparison[
+        "control"
+    ]["f1"]["delta"] == pytest.approx(0.0)
 
-    assert np.isnan(result["roc_auc"])
-    assert np.isnan(result["pr_auc"])
-    assert np.isfinite(result["f1"])
+    assert comparison[
+        "mild"
+    ]["f1"]["delta"] == pytest.approx(-0.02)
 
-def test_evaluate_model_does_not_fit(
-    sample_data,
+    assert comparison[
+        "moderate"
+    ]["f1"]["delta"] == pytest.approx(-0.10)
+
+    assert comparison[
+        "severe"
+    ]["f1"]["delta"] == pytest.approx(-0.30)
+
+
+def test_relative_degradation(
+    example_results,
 ):
-    X, y = sample_data
+    """Relative degradation must use control as baseline."""
 
-    model = MockClassifier()
-    model.fit = MagicMock(
-        side_effect=AssertionError(
-            "Model must not be fitted."
-        )
+    comparison = robustness.compare_to_control(
+        example_results
     )
 
-    robustness.evaluate_model(
-        model,
-        X,
-        y,
-        threshold=0.5,
+    expected = (0.80 - 0.50) / 0.80
+
+    assert comparison[
+        "severe"
+    ]["f1"]["relative_degradation"] == (
+        pytest.approx(expected)
     )
 
-    model.fit.assert_not_called()
+
+def test_improvement_has_negative_degradation(
+    example_results,
+):
+    """Metric improvement must produce negative degradation."""
+
+    example_results["mild"]["f1"] = 0.85
+
+    comparison = robustness.compare_to_control(
+        example_results
+    )
+
+    assert comparison[
+        "mild"
+    ]["f1"]["delta"] > 0
+
+    assert comparison[
+        "mild"
+    ]["f1"]["relative_degradation"] < 0
+
+
+def test_zero_control_metric(
+    example_results,
+):
+    """Avoid division by zero in relative degradation."""
+
+    example_results["control"]["f1"] = 0.0
+
+    comparison = robustness.compare_to_control(
+        example_results
+    )
+
+    assert comparison[
+        "severe"
+    ]["f1"]["relative_degradation"] is None
 
 
 # ============================================================
-# 6. Performance Degradation
+# 8. Report generation
 # ============================================================
 
-@pytest.mark.parametrize(
-    "baseline, current, expected",
-    [
-        (0.8, 0.6, 25.0),
-        (0.8, 0.9, -12.5),
-        (0.8, 0.8, 0.0),
-        (1.0, 0.0, 100.0),
-    ],
-)
-def test_calculate_degradation(
-    baseline,
-    current,
-    expected,
+def test_save_reports_creates_files(
+    tmp_path,
+    example_results,
 ):
-    result = robustness.calculate_degradation(
-        baseline,
-        current,
+    """JSON and CSV reports must be created."""
+
+    comparison = robustness.compare_to_control(
+        example_results
     )
 
-    assert result == pytest.approx(expected)
+    output_dir = tmp_path / "reports"
 
-
-@pytest.mark.parametrize(
-    "baseline, current",
-    [
-        (0.0, 0.5),
-        (np.nan, 0.5),
-        (0.5, np.nan),
-        (np.inf, 0.5),
-        (0.5, np.inf),
-    ],
-)
-def test_calculate_degradation_invalid_values(
-    baseline,
-    current,
-):
-    result = robustness.calculate_degradation(
-        baseline,
-        current,
+    json_path, csv_path = robustness.save_reports(
+        example_results,
+        comparison,
+        {
+            "model_family": "logistic_regression",
+            "preprocessing_variant": "baseline",
+            "model_sha256": "test-hash",
+        },
+        output_dir,
+        threshold=0.40,
     )
 
-    assert np.isnan(result)
+    assert json_path.is_file()
+    assert csv_path.is_file()
 
 
-# ============================================================
-# 7. Four-Scenario Evaluation
-# ============================================================
-
-def test_evaluate_robustness_all_scenarios(
-    model,
-    scenario_paths,
+def test_json_report_structure(
+    tmp_path,
+    example_results,
 ):
-    results = robustness.evaluate_robustness(
-        model=model,
-        threshold=0.5,
-        dataset_paths=scenario_paths,
+    """JSON reports must include model and scenario data."""
+
+    comparison = robustness.compare_to_control(
+        example_results
     )
 
-    assert isinstance(results, pd.DataFrame)
+    json_path, _ = robustness.save_reports(
+        example_results,
+        comparison,
+        {
+            "model_family": "logistic_regression",
+            "preprocessing_variant": "baseline",
+            "model_sha256": "test-hash",
+        },
+        tmp_path / "reports",
+        threshold=0.40,
+    )
 
-    assert list(results.index) == list(
+    report = json.loads(
+        json_path.read_text(encoding="utf-8")
+    )
+
+    assert "reference_model" in report
+    assert "scenarios" in report
+    assert "comparison_to_control" in report
+
+    assert report[
+        "reference_model"
+    ]["decision_threshold"] == pytest.approx(0.40)
+
+    assert set(report["scenarios"]) == set(
         robustness.SCENARIOS
     )
 
-    assert results.index.name == "scenario"
 
-    assert (results["n_samples"] == 4).all()
-
-
-def test_evaluate_robustness_calculates_degradation(
-    model,
-    scenario_paths,
+def test_csv_report_structure(
+    tmp_path,
+    example_results,
 ):
-    results = robustness.evaluate_robustness(
-        model=model,
-        threshold=0.5,
-        dataset_paths=scenario_paths,
+    """CSV reports must contain all scenarios and metrics."""
+
+    comparison = robustness.compare_to_control(
+        example_results
     )
 
-    assert results.loc[
-        "control", "f1_delta"
-    ] == pytest.approx(0.0)
-
-    assert results.loc[
-        "control", "f1_degradation_pct"
-    ] == pytest.approx(0.0)
-
-    assert results.loc[
-        "severe", "f1"
-    ] < results.loc[
-        "control", "f1"
-    ]
-
-    assert results.loc[
-        "severe", "f1_degradation_pct"
-    ] > 0
-
-
-def test_evaluate_robustness_all_metric_columns(
-    model,
-    scenario_paths,
-):
-    results = robustness.evaluate_robustness(
-        model=model,
-        threshold=0.5,
-        dataset_paths=scenario_paths,
+    _, csv_path = robustness.save_reports(
+        example_results,
+        comparison,
+        {},
+        tmp_path / "reports",
+        threshold=0.40,
     )
 
-    for metric in robustness.METRIC_NAMES:
+    frame = pd.read_csv(csv_path)
 
-        assert metric in results.columns
+    assert len(frame) == 4
 
-        assert f"{metric}_delta" in results.columns
-
-        assert (
-            f"{metric}_degradation_pct"
-            in results.columns
-        )
-
-
-def test_evaluate_robustness_missing_scenario(
-    model,
-    scenario_paths,
-):
-    del scenario_paths["severe"]
-
-    with pytest.raises(
-        ValueError,
-        match="Missing scenarios",
-    ):
-        robustness.evaluate_robustness(
-            model=model,
-            threshold=0.5,
-            dataset_paths=scenario_paths,
-        )
-
-
-def test_evaluate_robustness_preserves_files(
-    model,
-    scenario_paths,
-):
-    files = []
-
-    for paths in scenario_paths.values():
-        files.extend([
-            paths["features"],
-            paths["target"],
-        ])
-
-    before = {
-        path: path.read_bytes()
-        for path in files
-    }
-
-    robustness.evaluate_robustness(
-        model=model,
-        threshold=0.5,
-        dataset_paths=scenario_paths,
+    assert list(frame["scenario"]) == list(
+        robustness.SCENARIOS
     )
 
-    for path in files:
-        assert path.read_bytes() == before[path]
-
-
-def test_evaluate_robustness_uses_same_model(
-    model,
-    scenario_paths,
-):
-    model.predict_proba = MagicMock(
-        wraps=model.predict_proba
+    assert "f1" in frame.columns
+    assert "roc_auc" in frame.columns
+    assert "f1_delta" in frame.columns
+    assert "f1_relative_degradation" in (
+        frame.columns
     )
-
-    robustness.evaluate_robustness(
-        model=model,
-        threshold=0.5,
-        dataset_paths=scenario_paths,
-    )
-
-    assert model.predict_proba.call_count == 4
 
 
 # ============================================================
-# 8. CLI
+# 9. End-to-end orchestration
 # ============================================================
 
-def test_parse_args_requires_all_scenarios(monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["robustness.py"],
-    )
-
-    with pytest.raises(SystemExit) as exc:
-        robustness.parse_args()
-
-    assert exc.value.code == 2
-
-
-def test_parse_args_accepts_dataset_paths(monkeypatch):
-    argv = ["robustness.py"]
-
-    for scenario in robustness.SCENARIOS:
-        argv.extend([
-            f"--{scenario}",
-            f"data/drift/{scenario}/X_test.csv",
-            f"--{scenario}-target",
-            f"data/drift/{scenario}/y_test.csv",
-        ])
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        argv,
-    )
-
-    args = robustness.parse_args()
-
-    for scenario in robustness.SCENARIOS:
-
-        assert getattr(
-            args,
-            scenario,
-        ) == Path(
-            f"data/drift/{scenario}/X_test.csv"
-        )
-
-        assert getattr(
-            args,
-            f"{scenario}_target",
-        ) == Path(
-            f"data/drift/{scenario}/y_test.csv"
-        )
-
-
-def test_main_runs_complete_workflow(
-    monkeypatch,
-    model_files,
-    scenario_paths,
-    capsys,
+def test_run_robustness_end_to_end(
+    robustness_args,
 ):
-    model_path, metadata_path = model_files
+    """
+    Execute the complete robustness workflow.
 
-    argv = [
-        "robustness.py",
-        "--model",
-        str(model_path),
-        "--metadata",
-        str(metadata_path),
-    ]
+    Uses:
+        - Temporary reference model
+        - Four synthetic datasets
+        - Temporary report directory
+    """
 
-    for scenario, paths in scenario_paths.items():
-        argv.extend([
-            f"--{scenario}",
-            str(paths["features"]),
-            f"--{scenario}-target",
-            str(paths["target"]),
-        ])
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        argv,
+    results, comparison = (
+        robustness.run_robustness(
+            robustness_args
+        )
     )
 
-    results = robustness.main()
+    assert set(results) == set(
+        robustness.SCENARIOS
+    )
 
-    output = capsys.readouterr().out
+    assert set(comparison) == set(
+        robustness.SCENARIOS
+    )
 
-    assert isinstance(results, pd.DataFrame)
-
-    assert len(results) == 4
+    for scenario in robustness.SCENARIOS:
+        assert results[scenario]["rows"] == 120
 
     assert (
-        "SPRINT 17 - MODEL ROBUSTNESS UNDER DATA DRIFT"
-        in output
+        robustness_args.output_dir
+        / "robustness_report.json"
+    ).is_file()
+
+    assert (
+        robustness_args.output_dir
+        / "robustness_summary.csv"
+    ).is_file()
+
+
+def test_run_robustness_preserves_reference(
+    robustness_args,
+):
+    """Evaluation must not change reference artifacts."""
+
+    model_path = robustness_args.model
+    metadata_path = robustness_args.metadata
+
+    before_model = robustness.file_sha256(
+        model_path
     )
 
-    assert "CLASSIFICATION METRICS" in output
-    assert "PERFORMANCE DEGRADATION" in output
+    before_metadata = robustness.file_sha256(
+        metadata_path
+    )
 
-    for scenario in robustness.SCENARIOS:
-        assert scenario in output
+    robustness.run_robustness(
+        robustness_args
+    )
+
+    assert robustness.file_sha256(
+        model_path
+    ) == before_model
+
+    assert robustness.file_sha256(
+        metadata_path
+    ) == before_metadata
+
+
+def test_run_robustness_uses_saved_threshold(
+    robustness_args,
+    synthetic_data,
+):
+    """
+    The orchestration must use the threshold stored
+    in reference metadata.
+    """
+
+    results, _ = robustness.run_robustness(
+        robustness_args
+    )
+
+    model, _, threshold = (
+        robustness.load_reference_model(
+            robustness_args.model,
+            robustness_args.metadata,
+        )
+    )
+
+    X, y = synthetic_data
+
+    expected = robustness.evaluate_model(
+        model,
+        X,
+        y,
+        threshold,
+    )
+
+    assert results["control"]["f1"] == (
+        pytest.approx(expected["f1"])
+    )
+
+
+def test_run_robustness_rejects_missing_scenario(
+    robustness_args,
+    tmp_path,
+):
+    """Missing scenario datasets must stop evaluation."""
+
+    robustness_args.severe = (
+        tmp_path / "missing_severe.csv"
+    )
+
+    with pytest.raises(
+        FileNotFoundError,
+        match="Feature dataset not found",
+    ):
+        robustness.run_robustness(
+            robustness_args
+        )

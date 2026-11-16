@@ -30,6 +30,9 @@ The script:
     - Evaluates winners using held-out test data.
     - Tracks experiments using MLflow.
     - Preserves feature names in deployable pipelines.
+    - Saves each training execution to a unique models/runs/<run_id>/ directory.
+    - Never modifies DVC-tracked models/reference/ artifacts.
+    - Does not automatically promote newly trained models.
 """
 
 from __future__ import annotations
@@ -38,9 +41,9 @@ import argparse
 import hashlib
 import json
 import logging
-import shutil
 import subprocess
 import os
+import uuid
 import tempfile
 import warnings
 
@@ -687,12 +690,18 @@ def train(args):
 
     processed = args.processed_dir.resolve()
     preprocessor_dir = args.preprocessor_dir.resolve()
-    output = args.output_dir.resolve()
-
-    output.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    # Each invocation owns a unique directory, including quick runs.
+    # Never reuse an existing directory or write into the DVC reference tree.
+    output_root = args.output_dir.resolve()
+    reference_dir = (ROOT / "models/reference").resolve()
+    if output_root == reference_dir or reference_dir in output_root.parents or output_root in reference_dir.parents:
+        raise ValueError("Training output directory must be separate from models/reference")
+    output_root.mkdir(parents=True, exist_ok=True)
+    execution_id = uuid.uuid4().hex
+    output = output_root / execution_id
+    output.mkdir(exist_ok=False)
+    LOG.info("Training execution ID: %s", execution_id)
+    LOG.info("Training output: %s", output)
 
     db = args.mlflow_db.resolve()
     artifacts = args.mlflow_artifacts.resolve()
@@ -969,6 +978,8 @@ def train(args):
     )
 
     summary = {
+        "execution_id": execution_id,
+        "output_dir": str(output),
         "preferred_variant_by_validation": preferred,
         "quick": args.quick,
         "candidate_count": len(leaderboard),
@@ -1136,55 +1147,40 @@ def train(args):
         )
 
     # --------------------------------------------------------
-    # Promote overall validation winner for inference
+    # Save the overall validation winner as a run-local candidate.
+    # This is NOT a promotion. The DVC reference remains untouched.
     # --------------------------------------------------------
 
-    # Quick runs must not overwrite a promoted full-run model.
     if not args.quick:
+        best_info, selected_classifier, selected_data = winners[preferred]
+        source_model = output / preferred / "model_pipeline.joblib"
+        source_threshold = output / preferred / "decision_threshold.json"
 
-        best_info, _, _ = winners[preferred]
+        if not source_model.is_file() or not source_threshold.is_file():
+            raise FileNotFoundError("Winning model or threshold artifact is missing")
 
-        source_model = (
-            output / preferred / "model_pipeline.joblib"
-        )
-
-        source_threshold = (
-            output / preferred / "decision_threshold.json"
-        )
-
-        if (
-            not source_model.is_file()
-            or not source_threshold.is_file()
-        ):
-            raise FileNotFoundError(
-                "Winning model or threshold artifact is missing."
-            )
-
-        # Copy the exact serialized winning pipeline.
-        models_dir = output.parent
-
-        models_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        promoted_model = (
-            models_dir / "best_model_pipeline.joblib"
-        )
-
-        promoted_metadata = (
-            models_dir / "best_model_metadata.json"
-        )
-
-        # Validate the winning serialized model before touching the promoted copy.
-        selected_data = winners[preferred][2]
-        selected_classifier = winners[preferred][1]
         threshold_info = json.loads(source_threshold.read_text(encoding="utf-8"))
         threshold = float(threshold_info["threshold"])
         verify_saved_model(source_model, selected_data, selected_classifier, threshold)
 
-        # Record exact input and code fingerprints. Hashes are identifiers,
-        # not backups: durable historical copies still need artifact storage.
+        # Save a self-contained, verified model and metadata in this execution.
+        # An explicit, separate promotion procedure can later select this pair.
+        candidate_model = output / "best_model_pipeline.joblib"
+        candidate_metadata = output / "best_model_metadata.json"
+        model_bytes = source_model.read_bytes()
+        with tempfile.NamedTemporaryFile(
+            dir=output, prefix=".best_model_", suffix=".joblib", delete=False,
+        ) as handle:
+            temporary_model = Path(handle.name)
+        try:
+            temporary_model.write_bytes(model_bytes)
+            if file_sha256(temporary_model) != file_sha256(source_model):
+                raise ValueError("Model checksum changed during copying")
+            verify_saved_model(temporary_model, selected_data, selected_classifier, threshold)
+            os.replace(temporary_model, candidate_model)
+        finally:
+            temporary_model.unlink(missing_ok=True)
+
         metadata = {
             "model_family": best_info["model"],
             "preprocessing_variant": preferred,
@@ -1194,60 +1190,34 @@ def train(args):
             "validation_pr_auc": best_info["val_pr_auc"],
             "validation_roc_auc": best_info["val_roc_auc"],
             "mlflow_run_id": best_info["run_id"],
+            "execution_id": execution_id,
             "git_commit": git_revision(),
             "dataset_sha256": dataset_fingerprints(processed, preferred),
             "preprocessor_sha256": file_sha256(selected_data.preprocessor_path),
             "source_model_path": str(source_model),
-            "model_filename": promoted_model.name,
-            "model_sha256": file_sha256(source_model),
+            "model_filename": candidate_model.name,
+            "model_sha256": file_sha256(candidate_model),
+            "training_mode": "quick" if args.quick else "full",
         }
+        atomic_json_write(candidate_metadata, metadata)
 
-        # Publish a validated copy and metadata. Neither step retrains the model.
-        # Both writes are atomic individually; not a transactional pair.
-        with tempfile.NamedTemporaryFile(
-            dir=models_dir, prefix=".best_model_", suffix=".joblib",
-            delete=False,
-        ) as handle:
-            temporary_model = Path(handle.name)
-        try:
-            shutil.copy2(source_model, temporary_model)
-            if file_sha256(temporary_model) != metadata["model_sha256"]:
-                raise ValueError("Model checksum changed during copying")
-            verify_saved_model(temporary_model, selected_data, selected_classifier, threshold)
-            os.replace(temporary_model, promoted_model)
-        finally:
-            temporary_model.unlink(missing_ok=True)
-
-        atomic_json_write(promoted_metadata, metadata)
-
-        # Keep a copy of the promoted metadata in the selected MLflow run.
-        # This run already exists and contains its validation metrics.
+        # Attach the candidate artifacts to the selected MLflow run.
+        # Do not set a "promoted" tag: selection is not promotion.
         with mlflow.start_run(run_id=best_info["run_id"]):
-            mlflow.set_tag("promoted", "true")
+            mlflow.set_tag("training_execution_id", execution_id)
             mlflow.set_tag("model_sha256", metadata["model_sha256"])
+            mlflow.set_tag("candidate_for_promotion", "true")
             if metadata["git_commit"]:
                 mlflow.set_tag("git_commit", metadata["git_commit"])
-            mlflow.log_artifact(str(promoted_metadata), artifact_path="promotion")
-            mlflow.log_artifact(str(promoted_model), artifact_path="promotion")
+            mlflow.log_artifact(str(candidate_metadata), artifact_path="candidate")
+            mlflow.log_artifact(str(candidate_model), artifact_path="candidate")
 
-        summary["promoted_model"] = str(
-            promoted_model
-        )
+        summary["candidate_model"] = str(candidate_model)
+        summary["candidate_metadata"] = str(candidate_metadata)
+        LOG.info("Saved unpromoted model candidate: %s", candidate_model)
+        LOG.info("Saved candidate metadata: %s", candidate_metadata)
 
-        summary["promoted_metadata"] = str(
-            promoted_metadata
-        )
-
-        LOG.info(
-            "Promoted best model: %s",
-            promoted_model,
-        )
-
-        LOG.info(
-            "Promoted model metadata: %s",
-            promoted_metadata,
-        )
-
+    # --------------------------------------------------------
     # --------------------------------------------------------
     # Save training summary
     # --------------------------------------------------------
@@ -1302,7 +1272,8 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / "models/training",
+        default=ROOT / "models/runs",
+        help="Parent directory for unique per-execution output directories.",
     )
 
     parser.add_argument(

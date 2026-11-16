@@ -1,5 +1,0 @@
-outs:
-- md5: 1f8978e10a043b48736c5acadb1a2914
-  size: 663
-  hash: md5
-  path: best_model_metadata.json

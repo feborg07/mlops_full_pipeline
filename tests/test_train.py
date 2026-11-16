@@ -3,25 +3,8 @@
 Sprint 17 - MLOps Final Project
 Module: tests/test_train.py
 
-Automated tests for src/models/train.py.
-
-The suite uses the shared split_three_data fixture from
-tests/conftest.py.
-
-Coverage:
-    1. Dataset loading and validation
-    2. Model candidate generation
-    3. Logistic Regression configuration
-    4. Decision threshold optimization
-    5. Classification metrics
-    6. Validation-based model ranking
-    7. Artifact hashing
-    8. MLflow configuration
-    9. Quick training integration
-    10. Full training integration
-    11. Model serialization and inference
-    12. Input artifact preservation
-    13. MLflow experiment tracking
+Tests for isolated training executions, candidate models,
+MLflow tracking, and DVC reference-model protection.
 
 Run:
     python -m pytest tests/test_train.py -v
@@ -29,9 +12,11 @@ Run:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from argparse import Namespace
+from pathlib import Path
 
 import joblib
 import mlflow
@@ -53,132 +38,70 @@ from src.models import train as training
 
 @pytest.fixture
 def training_workspace(tmp_path, split_three_data):
-    """
-    Reuse synthetic Adult Income data from conftest.py.
+    """Create synthetic, saved preprocessing partitions."""
 
-    Create temporary:
-        - Train, validation, and test CSV files
-        - Fitted preprocessing artifacts
-        - Model output directories
-        - MLflow tracking database
+    X_train, X_val, X_test, y_train, y_val, y_test = (
+        split_three_data
+    )
 
-    The temporary environment simulates the project's
-    actual preprocessing outputs without using real data.
-    """
-
-    (
-        X_train,
-        X_val,
-        X_test,
-        y_train,
-        y_val,
-        y_test,
-    ) = split_three_data
-
-    # Use numeric predictors for a lightweight training fixture.
     numeric_columns = (
         X_train.select_dtypes(include="number")
         .columns.tolist()
     )
+    assert numeric_columns
 
-    assert numeric_columns, (
-        "The shared fixture must contain numeric predictors."
-    )
-
-    # Preserve the three partitions created by conftest.py.
     raw = {
-        "train": (
-            X_train[numeric_columns]
-            .reset_index(drop=True)
-        ),
-        "val": (
-            X_val[numeric_columns]
-            .reset_index(drop=True)
-        ),
-        "test": (
-            X_test[numeric_columns]
-            .reset_index(drop=True)
-        ),
+        "train": X_train[numeric_columns].reset_index(drop=True),
+        "val": X_val[numeric_columns].reset_index(drop=True),
+        "test": X_test[numeric_columns].reset_index(drop=True),
     }
 
     targets = {
-        "train": (
-            pd.Series(y_train, name="income")
-            .reset_index(drop=True)
-            .astype(int)
-        ),
-        "val": (
-            pd.Series(y_val, name="income")
-            .reset_index(drop=True)
-            .astype(int)
-        ),
-        "test": (
-            pd.Series(y_test, name="income")
-            .reset_index(drop=True)
-            .astype(int)
-        ),
+        name: pd.Series(y, name="income")
+        .reset_index(drop=True)
+        .astype(int)
+        for name, y in (
+            ("train", y_train),
+            ("val", y_val),
+            ("test", y_test),
+        )
     }
 
     assert set(targets["train"]) == {0, 1}
     assert set(targets["val"]) == {0, 1}
 
-    # Temporary project directories.
-    processed_dir = (
-        tmp_path / "data" / "processed"
-    )
+    processed_dir = tmp_path / "data" / "processed"
+    preprocessor_dir = tmp_path / "models" / "preprocessors"
+    output_dir = tmp_path / "models" / "runs"
+    reference_dir = tmp_path / "models" / "reference"
 
-    preprocessor_dir = (
-        tmp_path / "models" / "preprocessors"
-    )
+    preprocessor_dir.mkdir(parents=True)
+    reference_dir.mkdir(parents=True)
 
-    output_dir = (
-        tmp_path / "models" / "training"
-    )
-
-    preprocessor_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # Generate saved artifacts for every preprocessing variant.
     for variant in training.VARIANTS:
-
         variant_dir = processed_dir / variant
+        variant_dir.mkdir(parents=True)
 
-        variant_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        # Fit the synthetic preprocessor on training data only.
-        scaler = StandardScaler()
-
-        scaler.fit(raw["train"])
-
+        scaler = StandardScaler().fit(raw["train"])
         joblib.dump(
             scaler,
             preprocessor_dir / f"{variant}.joblib",
         )
 
-        # Transform all splits using the same fitted scaler.
         for split in ("train", "val", "test"):
-
             transformed = pd.DataFrame(
                 scaler.transform(raw[split]),
                 columns=numeric_columns,
             )
-
             transformed.to_csv(
                 variant_dir / f"X_{split}.csv",
                 index=False,
             )
-
             targets[split].to_frame().to_csv(
                 variant_dir / f"y_{split}.csv",
                 index=False,
             )
 
-    # Simulate command-line arguments.
     args = Namespace(
         processed_dir=processed_dir,
         preprocessor_dir=preprocessor_dir,
@@ -193,52 +116,35 @@ def training_workspace(tmp_path, split_three_data):
         "args": args,
         "raw": raw,
         "targets": targets,
+        "reference_dir": reference_dir,
     }
 
 
 @pytest.fixture
 def fast_candidates(monkeypatch):
-    """
-    Replace the production model sweep with one lightweight
-    Logistic Regression candidate.
-
-    This reduces execution time for integration tests while
-    preserving the actual training orchestration.
-    """
+    """Use one inexpensive classifier per variant."""
 
     def factory(quick=False):
-
-        estimator = LogisticRegression(
-            C=1.0,
-            max_iter=1000,
-            random_state=42,
-        )
-
         return [
             (
                 "logistic_regression",
                 {"C": 1.0},
-                estimator,
+                LogisticRegression(
+                    C=1.0,
+                    max_iter=1000,
+                    random_state=42,
+                ),
             )
         ]
 
-    monkeypatch.setattr(
-        training,
-        "candidates",
-        factory,
-    )
+    monkeypatch.setattr(training, "candidates", factory)
 
 
 @pytest.fixture
 def isolated_mlflow():
-    """
-    Restore the original MLflow tracking URI after each test.
-
-    MLflow tracking configuration is process-global.
-    """
+    """Restore process-global MLflow tracking configuration."""
 
     previous_uri = mlflow.get_tracking_uri()
-
     yield
 
     if mlflow.active_run() is not None:
@@ -248,14 +154,11 @@ def isolated_mlflow():
 
 
 # ============================================================
-# 2. Test helpers
+# 2. Helpers
 # ============================================================
 
 def load(workspace, variant="baseline"):
-    """Load a saved preprocessing variant."""
-
     args = workspace["args"]
-
     return training.load_variant(
         args.processed_dir,
         args.preprocessor_dir,
@@ -264,8 +167,6 @@ def load(workspace, variant="baseline"):
 
 
 def csv_path(workspace, filename, variant="baseline"):
-    """Return the path of a saved dataset partition."""
-
     return (
         workspace["args"].processed_dir
         / variant
@@ -273,70 +174,124 @@ def csv_path(workspace, filename, variant="baseline"):
     )
 
 
-def read_summary(workspace, quick=True):
-    """Load a generated training summary."""
+def execution_directories(workspace):
+    """Return directories created by training invocations."""
 
-    filename = (
+    root = workspace["args"].output_dir
+    if not root.exists():
+        return []
+
+    return sorted(
+        path for path in root.iterdir()
+        if path.is_dir()
+    )
+
+
+def run_training(workspace, quick=True):
+    """
+    Execute training and identify its new output directory.
+
+    The function deliberately does not depend on train()
+    returning a value.
+    """
+
+    args = workspace["args"]
+    args.quick = quick
+
+    before = set(execution_directories(workspace))
+    training.train(args)
+    after = set(execution_directories(workspace))
+
+    created = after - before
+    assert len(created) == 1
+
+    run_dir = created.pop()
+    assert run_dir.parent == args.output_dir.resolve()
+
+    summary_name = (
         "quick_training_summary.json"
-        if quick
-        else "training_summary.json"
+        if quick else "training_summary.json"
     )
 
-    path = (
-        workspace["args"].output_dir
-        / filename
+    summary = json.loads(
+        (run_dir / summary_name).read_text(
+            encoding="utf-8"
+        )
     )
 
-    return json.loads(
-        path.read_text(encoding="utf-8")
+    assert summary["quick"] is quick
+    assert summary["execution_id"] == run_dir.name
+    assert Path(summary["output_dir"]) == run_dir
+
+    return run_dir, summary
+
+
+def variant_model(run_dir, variant="baseline"):
+    return run_dir / variant / "model_pipeline.joblib"
+
+
+def variant_threshold(run_dir, variant="baseline"):
+    return run_dir / variant / "decision_threshold.json"
+
+
+def reference_hashes(workspace):
+    """Fingerprint every file in the reference directory."""
+
+    reference = workspace["reference_dir"]
+
+    return {
+        str(path.relative_to(reference)):
+            training.file_sha256(path)
+        for path in reference.rglob("*")
+        if path.is_file()
+    }
+
+
+def create_reference_artifacts(workspace):
+    """Simulate a DVC-recovered reference model."""
+
+    reference = workspace["reference_dir"]
+
+    (reference / "best_model_pipeline.joblib").write_bytes(
+        b"existing-reference-model"
     )
+
+    (reference / "best_model_metadata.json").write_text(
+        '{"reference": true}',
+        encoding="utf-8",
+    )
+
+    return reference_hashes(workspace)
 
 
 # ============================================================
-# 3. Dataset loading and validation tests
+# 3. Dataset loading and validation
 # ============================================================
 
 def test_load_variant_reads_saved_splits(training_workspace):
-    """Verify that all saved dataset partitions load correctly."""
-
     dataset = load(training_workspace)
 
     for split in ("train", "val", "test"):
-
         X = getattr(dataset, f"X_{split}")
         y = getattr(dataset, f"y_{split}")
 
         assert len(X) == len(
             training_workspace["raw"][split]
         )
-
         assert len(X) == len(y)
-
-        assert list(X.columns) == list(
-            dataset.X_train.columns
-        )
-
+        assert list(X.columns) == list(dataset.X_train.columns)
         assert set(y.unique()).issubset({0, 1})
 
     assert dataset.preprocessor_path.is_file()
 
 
 def test_loading_preserves_saved_rows(training_workspace):
-    """Loading must not remove, shuffle, or regenerate rows."""
-
     expected = pd.read_csv(
-        csv_path(
-            training_workspace,
-            "X_train.csv",
-        )
+        csv_path(training_workspace, "X_train.csv")
     )
-
     actual = load(training_workspace).X_train
 
-    pd.testing.assert_frame_equal(
-        actual,
-        expected,
-    )
+    pd.testing.assert_frame_equal(actual, expected)
 
 
 @pytest.mark.parametrize(
@@ -351,17 +306,9 @@ def test_loading_preserves_saved_rows(training_workspace):
     ],
 )
 def test_missing_partition_is_rejected(
-    training_workspace,
-    filename,
+    training_workspace, filename
 ):
-    """Missing saved partitions must raise FileNotFoundError."""
-
-    path = csv_path(
-        training_workspace,
-        filename,
-    )
-
-    path.unlink()
+    csv_path(training_workspace, filename).unlink()
 
     with pytest.raises(
         FileNotFoundError,
@@ -371,14 +318,10 @@ def test_missing_partition_is_rejected(
 
 
 def test_missing_preprocessor_is_rejected(training_workspace):
-    """A missing fitted preprocessor must be rejected."""
-
-    path = (
+    (
         training_workspace["args"].preprocessor_dir
         / "baseline.joblib"
-    )
-
-    path.unlink()
+    ).unlink()
 
     with pytest.raises(
         FileNotFoundError,
@@ -388,21 +331,10 @@ def test_missing_preprocessor_is_rejected(training_workspace):
 
 
 def test_missing_feature_is_rejected(training_workspace):
-    """Processed feature matrices must not contain NaN."""
-
-    path = csv_path(
-        training_workspace,
-        "X_train.csv",
-    )
-
+    path = csv_path(training_workspace, "X_train.csv")
     df = pd.read_csv(path)
-
     df.iloc[0, 0] = np.nan
-
-    df.to_csv(
-        path,
-        index=False,
-    )
+    df.to_csv(path, index=False)
 
     with pytest.raises(
         ValueError,
@@ -412,31 +344,13 @@ def test_missing_feature_is_rejected(training_workspace):
 
 
 def test_non_numeric_feature_is_rejected(training_workspace):
-    """
-    Non-numeric processed features must be rejected.
-
-    Convert the column to object dtype before inserting
-    a string to maintain compatibility with recent pandas.
-    """
-
-    path = csv_path(
-        training_workspace,
-        "X_train.csv",
-    )
-
+    path = csv_path(training_workspace, "X_train.csv")
     df = pd.read_csv(path)
 
     column = df.columns[0]
-
-    # Explicit dtype conversion avoids pandas TypeError.
     df[column] = df[column].astype(object)
-
     df.loc[0, column] = "not-a-number"
-
-    df.to_csv(
-        path,
-        index=False,
-    )
+    df.to_csv(path, index=False)
 
     with pytest.raises(
         ValueError,
@@ -446,21 +360,10 @@ def test_non_numeric_feature_is_rejected(training_workspace):
 
 
 def test_infinite_feature_is_rejected(training_workspace):
-    """Infinite feature values must be rejected."""
-
-    path = csv_path(
-        training_workspace,
-        "X_train.csv",
-    )
-
+    path = csv_path(training_workspace, "X_train.csv")
     df = pd.read_csv(path)
-
     df.iloc[0, 0] = np.inf
-
-    df.to_csv(
-        path,
-        index=False,
-    )
+    df.to_csv(path, index=False)
 
     with pytest.raises(
         ValueError,
@@ -470,21 +373,10 @@ def test_infinite_feature_is_rejected(training_workspace):
 
 
 def test_invalid_target_is_rejected(training_workspace):
-    """Target values must contain only binary labels."""
-
-    path = csv_path(
-        training_workspace,
-        "y_train.csv",
-    )
-
+    path = csv_path(training_workspace, "y_train.csv")
     df = pd.read_csv(path)
-
     df.iloc[0, 0] = 2
-
-    df.to_csv(
-        path,
-        index=False,
-    )
+    df.to_csv(path, index=False)
 
     with pytest.raises(
         ValueError,
@@ -496,21 +388,10 @@ def test_invalid_target_is_rejected(training_workspace):
 def test_multiple_target_columns_are_rejected(
     training_workspace,
 ):
-    """Target files must contain exactly one column."""
-
-    path = csv_path(
-        training_workspace,
-        "y_train.csv",
-    )
-
+    path = csv_path(training_workspace, "y_train.csv")
     df = pd.read_csv(path)
-
     df["extra"] = df.iloc[:, 0]
-
-    df.to_csv(
-        path,
-        index=False,
-    )
+    df.to_csv(path, index=False)
 
     with pytest.raises(
         ValueError,
@@ -518,24 +399,13 @@ def test_multiple_target_columns_are_rejected(
     ):
         load(training_workspace)
 
+
 def test_feature_order_mismatch_is_rejected(
     training_workspace,
 ):
-    """Feature order must match across all dataset partitions."""
-
-    path = csv_path(
-        training_workspace,
-        "X_val.csv",
-    )
-
+    path = csv_path(training_workspace, "X_val.csv")
     df = pd.read_csv(path)
-
-    df = df[df.columns[::-1]]
-
-    df.to_csv(
-        path,
-        index=False,
-    )
+    df[df.columns[::-1]].to_csv(path, index=False)
 
     with pytest.raises(
         ValueError,
@@ -547,19 +417,9 @@ def test_feature_order_mismatch_is_rejected(
 def test_feature_target_row_mismatch_is_rejected(
     training_workspace,
 ):
-    """Feature and target row counts must be identical."""
-
-    path = csv_path(
-        training_workspace,
-        "y_train.csv",
-    )
-
+    path = csv_path(training_workspace, "y_train.csv")
     df = pd.read_csv(path)
-
-    df.iloc[:-1].to_csv(
-        path,
-        index=False,
-    )
+    df.iloc[:-1].to_csv(path, index=False)
 
     with pytest.raises(
         ValueError,
@@ -569,22 +429,14 @@ def test_feature_target_row_mismatch_is_rejected(
 
 
 # ============================================================
-# 4. Model candidate tests
+# 4. Model candidate generation
 # ============================================================
 
 def test_full_candidate_count_and_families():
-    """Full mode must generate 18 candidates across four families."""
-
     specs = training.candidates(quick=False)
 
     assert len(specs) == 18
-
-    families = {
-        family
-        for family, _, _ in specs
-    }
-
-    assert families == {
+    assert {family for family, _, _ in specs} == {
         "logistic_regression",
         "random_forest",
         "hist_gradient_boosting",
@@ -593,79 +445,43 @@ def test_full_candidate_count_and_families():
 
 
 def test_quick_candidate_count():
-    """Quick mode must generate four candidates."""
-
-    specs = training.candidates(quick=True)
-
-    assert len(specs) == 4
+    assert len(training.candidates(quick=True)) == 4
 
 
 def test_logistic_regression_configuration():
-    """
-    Logistic Regression candidates must use a pipeline
-    with StandardScaler followed by LogisticRegression.
-    """
-
-    logistic_models = [
+    models = [
         model
-        for family, _, model in training.candidates(
-            quick=False
-        )
+        for family, _, model in training.candidates(False)
         if family == "logistic_regression"
     ]
 
-    assert len(logistic_models) == 6
+    assert len(models) == 6
 
-    for model in logistic_models:
-
+    for model in models:
+        assert isinstance(model, Pipeline)
+        assert isinstance(model.steps[0][1], StandardScaler)
         assert isinstance(
-            model,
-            Pipeline,
-        )
-
-        assert isinstance(
-            model.steps[0][1],
-            StandardScaler,
-        )
-
-        classifier = model.steps[-1][1]
-
-        assert isinstance(
-            classifier,
+            model.steps[-1][1],
             LogisticRegression,
         )
-
-        assert classifier.max_iter == 5000
+        assert model.steps[-1][1].max_iter == 5000
 
 
 # ============================================================
-# 5. Threshold optimization tests
+# 5. Thresholds, metrics, and ranking
 # ============================================================
 
 def test_optimal_threshold_maximizes_validation_f1():
-    """Selected threshold must maximize validation F1."""
-
-    y = pd.Series([
-        0, 0, 0, 1, 1, 1,
-    ])
-
-    probabilities = np.array([
-        0.10,
-        0.20,
-        0.40,
-        0.35,
-        0.70,
-        0.90,
-    ])
-
-    precision, recall, thresholds = (
-        precision_recall_curve(
-            y,
-            probabilities,
-        )
+    y = pd.Series([0, 0, 0, 1, 1, 1])
+    probabilities = np.array(
+        [0.10, 0.20, 0.40, 0.35, 0.70, 0.90]
     )
 
-    f1_scores = (
+    precision, recall, thresholds = (
+        precision_recall_curve(y, probabilities)
+    )
+
+    f1 = (
         2 * precision[:-1] * recall[:-1]
         / np.maximum(
             precision[:-1] + recall[:-1],
@@ -673,572 +489,115 @@ def test_optimal_threshold_maximizes_validation_f1():
         )
     )
 
-    expected = thresholds[
-        np.argmax(f1_scores)
-    ]
+    expected = thresholds[np.argmax(f1)]
 
-    actual = training.optimal_threshold(
-        y,
-        probabilities,
-    )
+    assert training.optimal_threshold(
+        y, probabilities
+    ) == pytest.approx(expected)
 
-    assert actual == pytest.approx(expected)
-
-
-# ============================================================
-# 6. Evaluation metrics tests
-# ============================================================
 
 def test_evaluate_perfect_predictions():
-    """Perfect predictions must produce perfect metrics."""
-
-    y = pd.Series([
-        0, 0, 1, 1,
-    ])
-
-    probabilities = np.array([
-        0.1, 0.2, 0.8, 0.9,
-    ])
-
     metrics = training.evaluate(
-        y,
-        probabilities,
+        pd.Series([0, 0, 1, 1]),
+        np.array([0.1, 0.2, 0.8, 0.9]),
         0.5,
     )
 
     for name in (
-        "f1",
-        "precision",
-        "recall",
-        "accuracy",
-        "pr_auc",
-        "roc_auc",
+        "f1", "precision", "recall",
+        "accuracy", "pr_auc", "roc_auc",
     ):
         assert metrics[name] == pytest.approx(1.0)
 
     assert metrics["confusion_matrix"] == [
-        [2, 0],
-        [0, 2],
+        [2, 0], [0, 2]
     ]
 
 
 def test_evaluate_known_confusion_matrix():
-    """Verify metrics against a known confusion matrix."""
-
-    y = pd.Series([
-        0, 0, 1, 1,
-    ])
-
-    probabilities = np.array([
-        0.1, 0.7, 0.8, 0.3,
-    ])
-
     metrics = training.evaluate(
-        y,
-        probabilities,
+        pd.Series([0, 0, 1, 1]),
+        np.array([0.1, 0.7, 0.8, 0.3]),
         0.5,
     )
 
     assert metrics["confusion_matrix"] == [
-        [1, 1],
-        [1, 1],
+        [1, 1], [1, 1]
     ]
 
-    for name in (
-        "f1",
-        "precision",
-        "recall",
-        "accuracy",
-    ):
+    for name in ("f1", "precision", "recall", "accuracy"):
         assert metrics[name] == pytest.approx(0.5)
 
 
-# ============================================================
-# 7. Validation-based ranking tests
-# ============================================================
-
 def test_ranking_uses_validation_f1_first():
-    """Validation F1 must have the highest ranking priority."""
-
-    model_a = {
+    a = {
         "val_f1": 0.80,
         "val_pr_auc": 0.60,
         "val_roc_auc": 0.60,
     }
-
-    model_b = {
+    b = {
         "val_f1": 0.70,
         "val_pr_auc": 0.90,
         "val_roc_auc": 0.90,
     }
 
-    assert training.rank(
-        model_a
-    ) > training.rank(
-        model_b
-    )
+    assert training.rank(a) > training.rank(b)
 
 
 def test_ranking_tiebreakers():
-    """PR-AUC and ROC-AUC must resolve validation F1 ties."""
-
-    model_a = {
+    a = {
         "val_f1": 0.80,
         "val_pr_auc": 0.90,
         "val_roc_auc": 0.80,
     }
-
-    model_b = {
+    b = {
         "val_f1": 0.80,
         "val_pr_auc": 0.80,
         "val_roc_auc": 0.99,
     }
-
-    model_c = {
+    c = {
         "val_f1": 0.80,
         "val_pr_auc": 0.90,
         "val_roc_auc": 0.70,
     }
 
-    assert training.rank(
-        model_a
-    ) > training.rank(
-        model_b
-    )
-
-    assert training.rank(
-        model_a
-    ) > training.rank(
-        model_c
-    )
+    assert training.rank(a) > training.rank(b)
+    assert training.rank(a) > training.rank(c)
 
 
 # ============================================================
-# 8. Artifact hashing tests
+# 6. Hashing, Git, and metadata utilities
 # ============================================================
 
 def test_file_sha256(tmp_path):
-    """Verify correct SHA-256 artifact hashing."""
-
     path = tmp_path / "artifact.txt"
-
     content = b"mlops-artifact"
-
     path.write_bytes(content)
 
-    expected = hashlib.sha256(
-        content
-    ).hexdigest()
-
-    actual = training.file_sha256(path)
-
-    assert actual == expected
-
-
-# ============================================================
-# 9. MLflow configuration tests
-# ============================================================
-
-def test_configure_mlflow_creates_experiment(
-    tmp_path,
-    isolated_mlflow,
-):
-    """MLflow must create a local tracking experiment."""
-
-    database = tmp_path / "tracking.db"
-
-    artifacts = tmp_path / "artifacts"
-
-    experiment_name = "pytest-configuration"
-
-    training.configure_mlflow(
-        experiment_name,
-        database,
-        artifacts,
+    assert training.file_sha256(path) == (
+        hashlib.sha256(content).hexdigest()
     )
 
-    experiment = mlflow.get_experiment_by_name(
-        experiment_name
-    )
-
-    assert experiment is not None
-
-    assert artifacts.is_dir()
-
-
-# ============================================================
-# 10. Quick training integration tests
-# ============================================================
-
-def test_quick_training_creates_artifacts(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """Quick training must save its expected model artifacts."""
-
-    args = training_workspace["args"]
-
-    training.train(args)
-
-    assert (
-        args.output_dir / "sweep_leaderboard.csv"
-    ).is_file()
-
-    summary = read_summary(
-        training_workspace,
-        quick=True,
-    )
-
-    assert summary["quick"] is True
-
-    assert summary["candidate_count"] == len(
-        training.VARIANTS
-    )
-
-    for variant in training.VARIANTS:
-
-        assert (
-            args.output_dir
-            / variant
-            / "model_pipeline.joblib"
-        ).is_file()
-
-        assert (
-            args.output_dir
-            / variant
-            / "decision_threshold.json"
-        ).is_file()
-
-        # Quick mode must not evaluate held-out test data.
-        assert "test" not in summary["winners"][variant]
-
-
-def test_quick_training_ranks_by_validation(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """Preferred variant must be selected using validation metrics."""
-
-    training.train(
-        training_workspace["args"]
-    )
-
-    summary = read_summary(
-        training_workspace,
-        quick=True,
-    )
-
-    expected = max(
-        training.VARIANTS,
-        key=lambda variant: training.rank(
-            summary["winners"][variant]["validation"]
-        ),
-    )
-
-    assert (
-        summary["preferred_variant_by_validation"]
-        == expected
-    )
-
-
-def test_quick_training_leaderboard(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """Quick training must generate a valid leaderboard."""
-
-    training.train(
-        training_workspace["args"]
-    )
-
-    leaderboard = pd.read_csv(
-        training_workspace["args"].output_dir
-        / "sweep_leaderboard.csv"
-    )
-
-    assert len(leaderboard) == len(
-        training.VARIANTS
-    )
-
-    assert set(
-        leaderboard["variant"]
-    ) == set(training.VARIANTS)
-
-    assert (
-        leaderboard["status"] == "FINISHED"
-    ).all()
-
-    assert leaderboard["val_f1"].notna().all()
-
-
-# ============================================================
-# 11. Full training integration tests
-# ============================================================
-
-def test_full_training_evaluates_held_out_test(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """Full training must evaluate winners on held-out test data."""
-
-    args = training_workspace["args"]
-
-    args.quick = False
-
-    training.train(args)
-
-    summary = read_summary(
-        training_workspace,
-        quick=False,
-    )
-
-    assert summary["quick"] is False
-
-    for variant in training.VARIANTS:
-
-        winner = summary["winners"][variant]
-
-        assert "validation" in winner
-        assert "test" in winner
-
-        assert 0 <= winner["test"]["f1"] <= 1
-
-        assert len(
-            winner["test"]["confusion_matrix"]
-        ) == 2
-
-        threshold_path = (
-            args.output_dir
-            / variant
-            / "decision_threshold.json"
-        )
-
-        saved_threshold = json.loads(
-            threshold_path.read_text(
-                encoding="utf-8"
-            )
-        )["threshold"]
-
-        expected_threshold = (
-            winner["validation"]["optimal_threshold"]
-        )
-
-        assert saved_threshold == pytest.approx(
-            expected_threshold
-        )
-
-
-# ============================================================
-# 12. Saved model inference tests
-# ============================================================
-
-def test_saved_pipeline_predicts_raw_inputs(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """Saved model pipeline must accept raw numeric inputs."""
-
-    args = training_workspace["args"]
-
-    training.train(args)
-
-    model_path = (
-        args.output_dir
-        / "baseline"
-        / "model_pipeline.joblib"
-    )
-
-    model = joblib.load(model_path)
-
-    assert isinstance(
-        model,
-        Pipeline,
-    )
-
-    # Verify the updated three-stage inference pipeline.
-    assert list(model.named_steps) == [
-        "preprocess",
-        "feature_names",
-        "classifier",
-    ]
-
-    raw = training_workspace["raw"]["test"]
-
-    probabilities = model.predict_proba(raw)
-
-    assert probabilities.shape == (
-        len(raw),
-        2,
-    )
-
-    assert np.isfinite(
-        probabilities
-    ).all()
-
-    np.testing.assert_allclose(
-        probabilities.sum(axis=1),
-        1.0,
-    )
-
-def test_saved_pipeline_matches_processed_predictions(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """
-    Raw-input pipeline predictions must match predictions
-    made using saved processed features.
-    """
-
-    args = training_workspace["args"]
-
-    training.train(args)
-
-    model = joblib.load(
-        args.output_dir
-        / "baseline"
-        / "model_pipeline.joblib"
-    )
-
-    raw = training_workspace["raw"]["test"]
-
-    processed = pd.read_csv(
-        csv_path(
-            training_workspace,
-            "X_test.csv",
-        )
-    )
-
-    raw_probabilities = model.predict_proba(raw)
-
-    processed_probabilities = (
-        model.named_steps["classifier"]
-        .predict_proba(processed)
-    )
-
-    np.testing.assert_allclose(
-        raw_probabilities,
-        processed_probabilities,
-        rtol=1e-6,
-        atol=1e-6,
-    )
-
-
-# ============================================================
-# 13. Input artifact preservation tests
-# ============================================================
-
-def test_training_preserves_input_files(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """
-    Training must not modify saved dataset partitions
-    or fitted preprocessing artifacts.
-    """
-
-    args = training_workspace["args"]
-
-    paths = (
-        sorted(
-            args.processed_dir.rglob("*.csv")
-        )
-        +
-        sorted(
-            args.preprocessor_dir.glob("*.joblib")
-        )
-    )
-
-    hashes_before = {
-        path: training.file_sha256(path)
-        for path in paths
-    }
-
-    training.train(args)
-
-    hashes_after = {
-        path: training.file_sha256(path)
-        for path in paths
-    }
-
-    assert hashes_before == hashes_after
-
-
-# ============================================================
-# 14. MLflow integration tests
-# ============================================================
-
-def test_training_logs_mlflow_runs(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
-):
-    """Training must record validation metrics in MLflow."""
-
-    args = training_workspace["args"]
-
-    training.train(args)
-
-    experiment = mlflow.get_experiment_by_name(
-        args.experiment
-    )
-
-    assert experiment is not None
-
-    runs = mlflow.search_runs(
-        experiment_ids=[
-            experiment.experiment_id
-        ]
-    )
-
-    assert len(runs) == len(
-        training.VARIANTS
-    )
-
-    assert "metrics.val_f1" in runs.columns
-
-    assert (
-        runs["metrics.val_f1"].notna()
-    ).all()
-
-
-
-# ============================================================
-# 15. Dataset fingerprint and Git traceability tests
-# ============================================================
 
 def test_dataset_fingerprints_match_saved_files(
     training_workspace,
 ):
-    """Every dataset fingerprint must match its saved CSV."""
-
     args = training_workspace["args"]
 
     fingerprints = training.dataset_fingerprints(
-        args.processed_dir,
-        "baseline",
+        args.processed_dir, "baseline"
     )
 
-    expected_files = {
+    expected = {
         f"{kind}_{split}.csv"
         for split in ("train", "val", "test")
         for kind in ("X", "y")
     }
 
-    assert set(fingerprints) == expected_files
+    assert set(fingerprints) == expected
 
     for filename, digest in fingerprints.items():
-        path = csv_path(
-            training_workspace,
-            filename,
-        )
-
+        path = csv_path(training_workspace, filename)
         assert digest == training.file_sha256(path)
         assert len(digest) == 64
 
@@ -1246,32 +605,21 @@ def test_dataset_fingerprints_match_saved_files(
 def test_dataset_fingerprint_detects_changes(
     training_workspace,
 ):
-    """Changing a dataset must change its fingerprint."""
-
     args = training_workspace["args"]
 
     before = training.dataset_fingerprints(
-        args.processed_dir,
-        "baseline",
+        args.processed_dir, "baseline"
     )
 
-    path = csv_path(
-        training_workspace,
-        "X_train.csv",
-    )
-
-    with path.open("a", encoding="utf-8") as file:
-        file.write("\n")
+    path = csv_path(training_workspace, "X_train.csv")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
 
     after = training.dataset_fingerprints(
-        args.processed_dir,
-        "baseline",
+        args.processed_dir, "baseline"
     )
 
-    assert (
-        before["X_train.csv"]
-        != after["X_train.csv"]
-    )
+    assert before["X_train.csv"] != after["X_train.csv"]
 
     for filename in before:
         if filename != "X_train.csv":
@@ -1279,16 +627,10 @@ def test_dataset_fingerprint_detects_changes(
 
 
 def test_git_revision_returns_commit(monkeypatch):
-    """Git revision must return the current commit hash."""
-
     expected = "a" * 40
 
     def fake_check_output(*args, **kwargs):
-        assert args[0] == [
-            "git",
-            "rev-parse",
-            "HEAD",
-        ]
+        assert args[0] == ["git", "rev-parse", "HEAD"]
         return expected + "\n"
 
     monkeypatch.setattr(
@@ -1301,8 +643,6 @@ def test_git_revision_returns_commit(monkeypatch):
 
 
 def test_git_revision_handles_missing_git(monkeypatch):
-    """Training must work outside a Git repository."""
-
     def fake_check_output(*args, **kwargs):
         raise FileNotFoundError("git unavailable")
 
@@ -1315,15 +655,8 @@ def test_git_revision_handles_missing_git(monkeypatch):
     assert training.git_revision() is None
 
 
-# ============================================================
-# 16. Atomic metadata writing tests
-# ============================================================
-
 def test_atomic_json_write(tmp_path):
-    """Metadata must be written as valid JSON."""
-
     path = tmp_path / "models" / "metadata.json"
-
     payload = {
         "model_family": "logistic_regression",
         "decision_threshold": 0.42,
@@ -1332,118 +665,217 @@ def test_atomic_json_write(tmp_path):
 
     training.atomic_json_write(path, payload)
 
-    assert path.is_file()
-
-    actual = json.loads(
-        path.read_text(encoding="utf-8")
-    )
-
-    assert actual == payload
-
-    # No temporary files should remain.
-    assert not list(
-        path.parent.glob("*.tmp")
-    )
+    assert json.loads(path.read_text()) == payload
+    assert not list(path.parent.glob("*.tmp"))
 
 
-def test_atomic_json_write_replaces_existing_file(
-    tmp_path,
-):
-    """Writing new metadata must replace the old contents."""
-
+def test_atomic_json_write_replaces_existing_file(tmp_path):
     path = tmp_path / "metadata.json"
 
-    training.atomic_json_write(
-        path,
-        {"version": 1},
-    )
+    training.atomic_json_write(path, {"version": 1})
+    training.atomic_json_write(path, {"version": 2})
 
-    training.atomic_json_write(
-        path,
-        {"version": 2},
-    )
-
-    actual = json.loads(
-        path.read_text(encoding="utf-8")
-    )
-
-    assert actual == {"version": 2}
+    assert json.loads(path.read_text()) == {"version": 2}
 
 
 # ============================================================
-# 17. Saved model artifact validation tests
+# 7. MLflow configuration
+# ============================================================
+
+def test_configure_mlflow_creates_experiment(
+    tmp_path, isolated_mlflow
+):
+    database = tmp_path / "tracking.db"
+    artifacts = tmp_path / "artifacts"
+
+    training.configure_mlflow(
+        "pytest-configuration",
+        database,
+        artifacts,
+    )
+
+    assert mlflow.get_experiment_by_name(
+        "pytest-configuration"
+    ) is not None
+
+    assert artifacts.is_dir()
+
+
+# ============================================================
+# 8. Quick training
+# ============================================================
+
+def test_quick_training_creates_artifacts(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    run_dir, summary = run_training(training_workspace)
+
+    assert (run_dir / "sweep_leaderboard.csv").is_file()
+    assert summary["candidate_count"] == len(
+        training.VARIANTS
+    )
+
+    for variant in training.VARIANTS:
+        assert variant_model(run_dir, variant).is_file()
+        assert variant_threshold(run_dir, variant).is_file()
+        assert "test" not in summary["winners"][variant]
+
+    # Quick training does not package an overall candidate.
+    assert not (run_dir / "best_model_pipeline.joblib").exists()
+    assert not (run_dir / "best_model_metadata.json").exists()
+
+
+def test_quick_training_ranks_by_validation(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    _, summary = run_training(training_workspace)
+
+    expected = max(
+        training.VARIANTS,
+        key=lambda variant: training.rank(
+            summary["winners"][variant]["validation"]
+        ),
+    )
+
+    assert summary["preferred_variant_by_validation"] == expected
+
+
+def test_quick_training_leaderboard(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    run_dir, _ = run_training(training_workspace)
+
+    leaderboard = pd.read_csv(
+        run_dir / "sweep_leaderboard.csv"
+    )
+
+    assert len(leaderboard) == len(training.VARIANTS)
+    assert set(leaderboard["variant"]) == set(
+        training.VARIANTS
+    )
+    assert (leaderboard["status"] == "FINISHED").all()
+    assert leaderboard["val_f1"].notna().all()
+
+
+# ============================================================
+# 9. Full training
+# ============================================================
+
+def test_full_training_evaluates_held_out_test(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    run_dir, summary = run_training(
+        training_workspace, quick=False
+    )
+
+    for variant in training.VARIANTS:
+        winner = summary["winners"][variant]
+
+        assert "validation" in winner
+        assert "test" in winner
+        assert 0 <= winner["test"]["f1"] <= 1
+        assert len(winner["test"]["confusion_matrix"]) == 2
+
+        threshold = json.loads(
+            variant_threshold(run_dir, variant).read_text()
+        )["threshold"]
+
+        assert threshold == pytest.approx(
+            winner["validation"]["optimal_threshold"]
+        )
+
+    assert (run_dir / "best_model_pipeline.joblib").is_file()
+    assert (run_dir / "best_model_metadata.json").is_file()
+
+
+# ============================================================
+# 10. Saved pipeline inference
+# ============================================================
+
+def test_saved_pipeline_predicts_raw_inputs(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    run_dir, _ = run_training(training_workspace)
+    model = joblib.load(variant_model(run_dir))
+
+    assert isinstance(model, Pipeline)
+    assert list(model.named_steps) == [
+        "preprocess",
+        "feature_names",
+        "classifier",
+    ]
+
+    raw = training_workspace["raw"]["test"]
+    probabilities = model.predict_proba(raw)
+
+    assert probabilities.shape == (len(raw), 2)
+    assert np.isfinite(probabilities).all()
+
+    np.testing.assert_allclose(
+        probabilities.sum(axis=1), 1.0
+    )
+
+
+def test_saved_pipeline_matches_processed_predictions(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    run_dir, _ = run_training(training_workspace)
+    model = joblib.load(variant_model(run_dir))
+
+    raw = training_workspace["raw"]["test"]
+    processed = pd.read_csv(
+        csv_path(training_workspace, "X_test.csv")
+    )
+
+    np.testing.assert_allclose(
+        model.predict_proba(raw),
+        model.named_steps["classifier"].predict_proba(
+            processed
+        ),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+# ============================================================
+# 11. Serialized model verification
 # ============================================================
 
 def test_verify_saved_model_accepts_valid_pipeline(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
+    training_workspace, fast_candidates, isolated_mlflow
 ):
-    """A correctly serialized model must pass validation."""
+    run_dir, _ = run_training(training_workspace)
 
-    args = training_workspace["args"]
-
-    training.train(args)
-
-    model_path = (
-        args.output_dir
-        / "baseline"
-        / "model_pipeline.joblib"
-    )
-
-    threshold_path = (
-        args.output_dir
-        / "baseline"
-        / "decision_threshold.json"
-    )
-
+    model_path = variant_model(run_dir)
     threshold = json.loads(
-        threshold_path.read_text(encoding="utf-8")
+        variant_threshold(run_dir).read_text()
     )["threshold"]
 
-    data = load(training_workspace)
+    classifier = joblib.load(
+        model_path
+    ).named_steps["classifier"]
 
-    saved_model = joblib.load(model_path)
-
-    classifier = saved_model.named_steps["classifier"]
-
-    # Must complete without raising an exception.
     training.verify_saved_model(
         model_path,
-        data,
+        load(training_workspace),
         classifier,
         threshold,
     )
 
 
-@pytest.mark.parametrize(
-    "threshold",
-    [-0.1, 1.1],
-)
+@pytest.mark.parametrize("threshold", [-0.1, 1.1])
 def test_verify_saved_model_rejects_invalid_threshold(
     training_workspace,
     fast_candidates,
     isolated_mlflow,
     threshold,
 ):
-    """Decision thresholds must remain between zero and one."""
+    run_dir, _ = run_training(training_workspace)
+    model_path = variant_model(run_dir)
 
-    args = training_workspace["args"]
-
-    training.train(args)
-
-    model_path = (
-        args.output_dir
-        / "baseline"
-        / "model_pipeline.joblib"
-    )
-
-    data = load(training_workspace)
-
-    classifier = (
-        joblib.load(model_path)
-        .named_steps["classifier"]
-    )
+    classifier = joblib.load(
+        model_path
+    ).named_steps["classifier"]
 
     with pytest.raises(
         ValueError,
@@ -1451,102 +883,179 @@ def test_verify_saved_model_rejects_invalid_threshold(
     ):
         training.verify_saved_model(
             model_path,
-            data,
+            load(training_workspace),
             classifier,
             threshold,
         )
 
 
-
 def test_verify_saved_model_detects_prediction_mismatch(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
+    training_workspace, fast_candidates, isolated_mlflow
 ):
-    """A saved classifier must match the expected trained model."""
+    run_dir, _ = run_training(training_workspace)
+    model_path = variant_model(run_dir)
 
-    import copy
+    classifier = joblib.load(
+        model_path
+    ).named_steps["classifier"]
 
-    args = training_workspace["args"]
+    altered = copy.deepcopy(classifier)
+    altered.coef_ = altered.coef_.copy()
+    altered.coef_[:] = 0.0
+    altered.intercept_ = altered.intercept_.copy()
+    altered.intercept_[:] = 10.0
 
-    training.train(args)
-
-    model_path = (
-        args.output_dir
-        / "baseline"
-        / "model_pipeline.joblib"
-    )
-
-    data = load(training_workspace)
-
-    saved_model = joblib.load(model_path)
-
-    classifier = saved_model.named_steps["classifier"]
-
-    # Create an independent copy of the trained classifier.
-    altered_classifier = copy.deepcopy(classifier)
-
-    # Change its learned coefficients to produce different
-    # probabilities without changing its interface.
-    altered_classifier.coef_ = (
-        altered_classifier.coef_.copy()
-    )
-
-    altered_classifier.coef_[:] = 0.0
-
-    altered_classifier.intercept_ = (
-        altered_classifier.intercept_.copy()
-    )
-
-    altered_classifier.intercept_[:] = 10.0
-
-    # The saved model and altered classifier should disagree.
     with pytest.raises(
         ValueError,
         match="Serialized classifier differs",
     ):
         training.verify_saved_model(
             model_path,
-            data,
-            altered_classifier,
+            load(training_workspace),
+            altered,
             0.5,
         )
 
 
 # ============================================================
-# 18. Promoted model metadata integration tests
+# 12. Input artifact preservation
 # ============================================================
 
-def test_promoted_model_has_traceable_metadata(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
+def test_training_preserves_input_files(
+    training_workspace, fast_candidates, isolated_mlflow
 ):
-    """A full training run must record artifact provenance."""
-
     args = training_workspace["args"]
-    args.quick = False
 
-    training.train(args)
-
-    model_path = (
-        args.output_dir.parent
-        / "best_model_pipeline.joblib"
+    paths = (
+        sorted(args.processed_dir.rglob("*.csv"))
+        + sorted(args.preprocessor_dir.glob("*.joblib"))
     )
 
-    metadata_path = (
-        args.output_dir.parent
-        / "best_model_metadata.json"
+    before = {
+        path: training.file_sha256(path)
+        for path in paths
+    }
+
+    run_training(training_workspace)
+
+    after = {
+        path: training.file_sha256(path)
+        for path in paths
+    }
+
+    assert before == after
+
+
+# ============================================================
+# 13. MLflow integration
+# ============================================================
+
+def test_training_logs_mlflow_runs(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    _, summary = run_training(training_workspace)
+    args = training_workspace["args"]
+
+    experiment = mlflow.get_experiment_by_name(
+        args.experiment
     )
+    assert experiment is not None
+
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id]
+    )
+
+    assert len(runs) == len(training.VARIANTS)
+    assert "metrics.val_f1" in runs.columns
+    assert runs["metrics.val_f1"].notna().all()
+
+    expected_ids = {
+        summary["winners"][variant]["validation"]["run_id"]
+        for variant in training.VARIANTS
+    }
+
+    assert set(runs["run_id"]) == expected_ids
+
+
+# ============================================================
+# 14. Run isolation
+# ============================================================
+
+def test_each_execution_has_unique_directory(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    first_dir, first = run_training(training_workspace)
+    second_dir, second = run_training(training_workspace)
+
+    assert first_dir != second_dir
+    assert first["execution_id"] != second["execution_id"]
+    assert first_dir.is_dir()
+    assert second_dir.is_dir()
+    assert len(execution_directories(training_workspace)) == 2
+
+
+def test_second_execution_preserves_first_artifacts(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    first_dir, _ = run_training(training_workspace)
+
+    before = {
+        str(path.relative_to(first_dir)):
+            training.file_sha256(path)
+        for path in first_dir.rglob("*")
+        if path.is_file()
+    }
+
+    run_training(training_workspace)
+
+    after = {
+        str(path.relative_to(first_dir)):
+            training.file_sha256(path)
+        for path in first_dir.rglob("*")
+        if path.is_file()
+    }
+
+    assert before == after
+
+
+def test_quick_and_full_runs_are_isolated(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    quick_dir, quick_summary = run_training(
+        training_workspace, quick=True
+    )
+    full_dir, full_summary = run_training(
+        training_workspace, quick=False
+    )
+
+    assert quick_dir != full_dir
+    assert quick_summary["quick"] is True
+    assert full_summary["quick"] is False
+
+    assert not (quick_dir / "best_model_pipeline.joblib").exists()
+    assert (full_dir / "best_model_pipeline.joblib").is_file()
+
+
+# ============================================================
+# 15. Candidate metadata and provenance
+# ============================================================
+
+def test_full_run_candidate_has_traceable_metadata(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    run_dir, summary = run_training(
+        training_workspace, quick=False
+    )
+
+    model_path = run_dir / "best_model_pipeline.joblib"
+    metadata_path = run_dir / "best_model_metadata.json"
 
     assert model_path.is_file()
     assert metadata_path.is_file()
 
-    metadata = json.loads(
-        metadata_path.read_text(encoding="utf-8")
-    )
+    metadata = json.loads(metadata_path.read_text())
 
-    required_fields = {
+    required = {
         "model_family",
         "preprocessing_variant",
         "decision_threshold",
@@ -1555,149 +1064,188 @@ def test_promoted_model_has_traceable_metadata(
         "validation_pr_auc",
         "validation_roc_auc",
         "mlflow_run_id",
+        "execution_id",
         "git_commit",
         "dataset_sha256",
         "preprocessor_sha256",
+        "source_model_path",
         "model_filename",
         "model_sha256",
     }
 
-    assert required_fields.issubset(metadata)
-
+    assert required.issubset(metadata)
+    assert metadata["execution_id"] == run_dir.name
     assert metadata["model_filename"] == model_path.name
-
     assert metadata["model_sha256"] == (
         training.file_sha256(model_path)
     )
-
     assert 0 <= metadata["decision_threshold"] <= 1
-
     assert metadata["positive_class"] == 1
 
     variant = metadata["preprocessing_variant"]
 
-    assert variant in training.VARIANTS
+    assert variant == summary[
+        "preferred_variant_by_validation"
+    ]
 
-    expected_fingerprints = (
+    assert metadata["dataset_sha256"] == (
         training.dataset_fingerprints(
-            args.processed_dir,
+            training_workspace["args"].processed_dir,
             variant,
         )
     )
 
-    assert (
-        metadata["dataset_sha256"]
-        == expected_fingerprints
-    )
-
-    preprocessor_path = (
-        args.preprocessor_dir
+    preprocessor = (
+        training_workspace["args"].preprocessor_dir
         / f"{variant}.joblib"
     )
 
     assert metadata["preprocessor_sha256"] == (
-        training.file_sha256(preprocessor_path)
+        training.file_sha256(preprocessor)
+    )
+
+    assert metadata["mlflow_run_id"] == (
+        summary["winners"][variant]["validation"]["run_id"]
     )
 
     git_commit = metadata["git_commit"]
-
-    assert (
-        git_commit is None
-        or (
-            isinstance(git_commit, str)
-            and len(git_commit) == 40
-        )
+    assert git_commit is None or (
+        isinstance(git_commit, str)
+        and len(git_commit) == 40
     )
 
+    assert Path(summary["candidate_model"]) == model_path
+    assert Path(summary["candidate_metadata"]) == metadata_path
 
-def test_promoted_artifacts_are_logged_to_mlflow(
-    training_workspace,
-    fast_candidates,
-    isolated_mlflow,
+
+def test_candidate_artifacts_are_logged_to_mlflow(
+    training_workspace, fast_candidates, isolated_mlflow
 ):
-    """The selected MLflow run must contain promotion artifacts."""
-
-    args = training_workspace["args"]
-    args.quick = False
-
-    training.train(args)
-
-    metadata_path = (
-        args.output_dir.parent
-        / "best_model_metadata.json"
+    run_dir, _ = run_training(
+        training_workspace, quick=False
     )
 
     metadata = json.loads(
-        metadata_path.read_text(encoding="utf-8")
+        (run_dir / "best_model_metadata.json").read_text()
     )
 
-    run_id = metadata["mlflow_run_id"]
-
     client = mlflow.tracking.MlflowClient()
-
+    run_id = metadata["mlflow_run_id"]
     run = client.get_run(run_id)
 
     assert run.info.status == "FINISHED"
-
-    assert run.data.tags["promoted"] == "true"
-
-    assert (
-        run.data.tags["model_sha256"]
-        == metadata["model_sha256"]
+    assert run.data.tags["candidate_for_promotion"] == "true"
+    assert run.data.tags["training_execution_id"] == (
+        metadata["execution_id"]
     )
+    assert run.data.tags["model_sha256"] == (
+        metadata["model_sha256"]
+    )
+
+    # Candidate selection must not mark the model as promoted.
+    assert run.data.tags.get("promoted") != "true"
 
     artifacts = client.list_artifacts(
-        run_id,
-        "promotion",
+        run_id, "candidate"
     )
 
-    artifact_names = {
-        artifact.path.split("/")[-1]
+    names = {
+        Path(artifact.path).name
         for artifact in artifacts
     }
 
-    assert "best_model_pipeline.joblib" in artifact_names
+    assert "best_model_pipeline.joblib" in names
+    assert "best_model_metadata.json" in names
 
-    assert "best_model_metadata.json" in artifact_names
 
+# ============================================================
+# 16. DVC reference-model protection
+# ============================================================
 
-def test_quick_training_does_not_replace_promoted_model(
+@pytest.mark.parametrize("quick", [True, False])
+def test_training_preserves_reference_artifacts(
     training_workspace,
     fast_candidates,
     isolated_mlflow,
+    quick,
 ):
-    """Quick experiments must preserve the existing promoted model."""
+    """Neither training mode may alter existing reference files."""
+
+    before = create_reference_artifacts(
+        training_workspace
+    )
+
+    run_dir, _ = run_training(
+        training_workspace, quick=quick
+    )
+
+    assert reference_hashes(training_workspace) == before
+    assert run_dir.is_dir()
+
+
+def test_repeated_training_preserves_reference(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    before = create_reference_artifacts(
+        training_workspace
+    )
+
+    run_training(training_workspace, quick=False)
+    run_training(training_workspace, quick=True)
+
+    assert reference_hashes(training_workspace) == before
+
+
+def test_full_training_does_not_automatically_promote(
+    training_workspace, fast_candidates, isolated_mlflow
+):
+    reference = training_workspace["reference_dir"]
+
+    run_dir, summary = run_training(
+        training_workspace, quick=False
+    )
+
+    # The candidate exists only inside its execution directory.
+    assert (run_dir / "best_model_pipeline.joblib").is_file()
+    assert (run_dir / "best_model_metadata.json").is_file()
+
+    assert "candidate_model" in summary
+    assert "candidate_metadata" in summary
+
+    # No reference artifacts are created automatically.
+    assert not (
+        reference / "best_model_pipeline.joblib"
+    ).exists()
+    assert not (
+        reference / "best_model_metadata.json"
+    ).exists()
+
+    # No legacy root-level promotion either.
+    models_dir = training_workspace["args"].output_dir.parent
+
+    assert not (
+        models_dir / "best_model_pipeline.joblib"
+    ).exists()
+    assert not (
+        models_dir / "best_model_metadata.json"
+    ).exists()
+
+
+def test_training_rejects_reference_as_output_directory(
+    training_workspace,
+):
+    """
+    Explicitly targeting the protected reference directory
+    must fail before training begins.
+    """
 
     args = training_workspace["args"]
 
-    args.quick = False
-    training.train(args)
+    # The production guard protects ROOT/models/reference.
+    args.output_dir = training.ROOT / "models" / "reference"
 
-    models_dir = args.output_dir.parent
-
-    model_path = (
-        models_dir / "best_model_pipeline.joblib"
-    )
-
-    metadata_path = (
-        models_dir / "best_model_metadata.json"
-    )
-
-    model_hash_before = training.file_sha256(
-        model_path
-    )
-
-    metadata_hash_before = training.file_sha256(
-        metadata_path
-    )
-
-    args.quick = True
-    training.train(args)
-
-    assert training.file_sha256(model_path) == (
-        model_hash_before
-    )
-
-    assert training.file_sha256(metadata_path) == (
-        metadata_hash_before
-    )
+    with pytest.raises(
+        ValueError,
+        match="separate from models/reference",
+    ):
+        training.train(args)

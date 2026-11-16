@@ -51,7 +51,17 @@ jobs:
 
       # 4. Restore versioned data and reference artifacts.
       - name: Pull DVC artifacts
-        run: dvc pull
+        run: |
+          dvc pull --verbose
+
+          echo "=== Reference directory ==="
+          ls -lah models/reference/
+
+          echo "=== Reference model ==="
+          test -f models/reference/best_model_pipeline.joblib
+
+          echo "=== Reference metadata ==="
+          test -f models/reference/best_model_metadata.json
 
       # 5. Run existing automated tests.
       - name: Run tests

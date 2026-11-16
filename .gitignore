@@ -73,6 +73,11 @@ desktop.ini
 # ------------------------------------------------------------
 /models/*
 !/models/.gitkeep
+# Allow DVC tracking files to be committed to Git.
+!/models/*.dvc
+
+# Allow the model-specific Git ignore file.
+!/models/.gitignore
 
 *.pkl
 *.pickle

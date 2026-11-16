@@ -1,0 +1,5 @@
+outs:
+- md5: 0480b1ae25feb55be49d718f61ca1b34
+  size: 245186
+  hash: md5
+  path: best_model_pipeline.joblib

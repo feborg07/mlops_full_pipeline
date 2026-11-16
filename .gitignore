@@ -108,6 +108,7 @@ mlflow.db-*
 # ------------------------------------------------------------
 /reports/figures/*
 /reports/drift/*
+/reports/robustness/
 
 !/reports/figures/.gitkeep
 !/reports/drift/.gitkeep

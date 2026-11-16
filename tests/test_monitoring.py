@@ -518,7 +518,7 @@ def test_create_evidently_dataset(reference_data):
         (0.200001, "warning"),
         (0.214285714, "warning"),
         (0.30, "warning"),
-        (0.35, "warning"),
+        (0.35, "critical"),
         (0.350001, "critical"),
         (0.357142857, "critical"),
         (0.50, "critical"),

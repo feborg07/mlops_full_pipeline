@@ -1206,3 +1206,498 @@ def test_training_logs_mlflow_runs(
     assert (
         runs["metrics.val_f1"].notna()
     ).all()
+
+
+
+# ============================================================
+# 15. Dataset fingerprint and Git traceability tests
+# ============================================================
+
+def test_dataset_fingerprints_match_saved_files(
+    training_workspace,
+):
+    """Every dataset fingerprint must match its saved CSV."""
+
+    args = training_workspace["args"]
+
+    fingerprints = training.dataset_fingerprints(
+        args.processed_dir,
+        "baseline",
+    )
+
+    expected_files = {
+        f"{kind}_{split}.csv"
+        for split in ("train", "val", "test")
+        for kind in ("X", "y")
+    }
+
+    assert set(fingerprints) == expected_files
+
+    for filename, digest in fingerprints.items():
+        path = csv_path(
+            training_workspace,
+            filename,
+        )
+
+        assert digest == training.file_sha256(path)
+        assert len(digest) == 64
+
+
+def test_dataset_fingerprint_detects_changes(
+    training_workspace,
+):
+    """Changing a dataset must change its fingerprint."""
+
+    args = training_workspace["args"]
+
+    before = training.dataset_fingerprints(
+        args.processed_dir,
+        "baseline",
+    )
+
+    path = csv_path(
+        training_workspace,
+        "X_train.csv",
+    )
+
+    with path.open("a", encoding="utf-8") as file:
+        file.write("\n")
+
+    after = training.dataset_fingerprints(
+        args.processed_dir,
+        "baseline",
+    )
+
+    assert (
+        before["X_train.csv"]
+        != after["X_train.csv"]
+    )
+
+    for filename in before:
+        if filename != "X_train.csv":
+            assert before[filename] == after[filename]
+
+
+def test_git_revision_returns_commit(monkeypatch):
+    """Git revision must return the current commit hash."""
+
+    expected = "a" * 40
+
+    def fake_check_output(*args, **kwargs):
+        assert args[0] == [
+            "git",
+            "rev-parse",
+            "HEAD",
+        ]
+        return expected + "\n"
+
+    monkeypatch.setattr(
+        training.subprocess,
+        "check_output",
+        fake_check_output,
+    )
+
+    assert training.git_revision() == expected
+
+
+def test_git_revision_handles_missing_git(monkeypatch):
+    """Training must work outside a Git repository."""
+
+    def fake_check_output(*args, **kwargs):
+        raise FileNotFoundError("git unavailable")
+
+    monkeypatch.setattr(
+        training.subprocess,
+        "check_output",
+        fake_check_output,
+    )
+
+    assert training.git_revision() is None
+
+
+# ============================================================
+# 16. Atomic metadata writing tests
+# ============================================================
+
+def test_atomic_json_write(tmp_path):
+    """Metadata must be written as valid JSON."""
+
+    path = tmp_path / "models" / "metadata.json"
+
+    payload = {
+        "model_family": "logistic_regression",
+        "decision_threshold": 0.42,
+        "model_sha256": "a" * 64,
+    }
+
+    training.atomic_json_write(path, payload)
+
+    assert path.is_file()
+
+    actual = json.loads(
+        path.read_text(encoding="utf-8")
+    )
+
+    assert actual == payload
+
+    # No temporary files should remain.
+    assert not list(
+        path.parent.glob("*.tmp")
+    )
+
+
+def test_atomic_json_write_replaces_existing_file(
+    tmp_path,
+):
+    """Writing new metadata must replace the old contents."""
+
+    path = tmp_path / "metadata.json"
+
+    training.atomic_json_write(
+        path,
+        {"version": 1},
+    )
+
+    training.atomic_json_write(
+        path,
+        {"version": 2},
+    )
+
+    actual = json.loads(
+        path.read_text(encoding="utf-8")
+    )
+
+    assert actual == {"version": 2}
+
+
+# ============================================================
+# 17. Saved model artifact validation tests
+# ============================================================
+
+def test_verify_saved_model_accepts_valid_pipeline(
+    training_workspace,
+    fast_candidates,
+    isolated_mlflow,
+):
+    """A correctly serialized model must pass validation."""
+
+    args = training_workspace["args"]
+
+    training.train(args)
+
+    model_path = (
+        args.output_dir
+        / "baseline"
+        / "model_pipeline.joblib"
+    )
+
+    threshold_path = (
+        args.output_dir
+        / "baseline"
+        / "decision_threshold.json"
+    )
+
+    threshold = json.loads(
+        threshold_path.read_text(encoding="utf-8")
+    )["threshold"]
+
+    data = load(training_workspace)
+
+    saved_model = joblib.load(model_path)
+
+    classifier = saved_model.named_steps["classifier"]
+
+    # Must complete without raising an exception.
+    training.verify_saved_model(
+        model_path,
+        data,
+        classifier,
+        threshold,
+    )
+
+
+@pytest.mark.parametrize(
+    "threshold",
+    [-0.1, 1.1],
+)
+def test_verify_saved_model_rejects_invalid_threshold(
+    training_workspace,
+    fast_candidates,
+    isolated_mlflow,
+    threshold,
+):
+    """Decision thresholds must remain between zero and one."""
+
+    args = training_workspace["args"]
+
+    training.train(args)
+
+    model_path = (
+        args.output_dir
+        / "baseline"
+        / "model_pipeline.joblib"
+    )
+
+    data = load(training_workspace)
+
+    classifier = (
+        joblib.load(model_path)
+        .named_steps["classifier"]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Invalid decision threshold",
+    ):
+        training.verify_saved_model(
+            model_path,
+            data,
+            classifier,
+            threshold,
+        )
+
+
+
+def test_verify_saved_model_detects_prediction_mismatch(
+    training_workspace,
+    fast_candidates,
+    isolated_mlflow,
+):
+    """A saved classifier must match the expected trained model."""
+
+    import copy
+
+    args = training_workspace["args"]
+
+    training.train(args)
+
+    model_path = (
+        args.output_dir
+        / "baseline"
+        / "model_pipeline.joblib"
+    )
+
+    data = load(training_workspace)
+
+    saved_model = joblib.load(model_path)
+
+    classifier = saved_model.named_steps["classifier"]
+
+    # Create an independent copy of the trained classifier.
+    altered_classifier = copy.deepcopy(classifier)
+
+    # Change its learned coefficients to produce different
+    # probabilities without changing its interface.
+    altered_classifier.coef_ = (
+        altered_classifier.coef_.copy()
+    )
+
+    altered_classifier.coef_[:] = 0.0
+
+    altered_classifier.intercept_ = (
+        altered_classifier.intercept_.copy()
+    )
+
+    altered_classifier.intercept_[:] = 10.0
+
+    # The saved model and altered classifier should disagree.
+    with pytest.raises(
+        ValueError,
+        match="Serialized classifier differs",
+    ):
+        training.verify_saved_model(
+            model_path,
+            data,
+            altered_classifier,
+            0.5,
+        )
+
+
+# ============================================================
+# 18. Promoted model metadata integration tests
+# ============================================================
+
+def test_promoted_model_has_traceable_metadata(
+    training_workspace,
+    fast_candidates,
+    isolated_mlflow,
+):
+    """A full training run must record artifact provenance."""
+
+    args = training_workspace["args"]
+    args.quick = False
+
+    training.train(args)
+
+    model_path = (
+        args.output_dir.parent
+        / "best_model_pipeline.joblib"
+    )
+
+    metadata_path = (
+        args.output_dir.parent
+        / "best_model_metadata.json"
+    )
+
+    assert model_path.is_file()
+    assert metadata_path.is_file()
+
+    metadata = json.loads(
+        metadata_path.read_text(encoding="utf-8")
+    )
+
+    required_fields = {
+        "model_family",
+        "preprocessing_variant",
+        "decision_threshold",
+        "positive_class",
+        "validation_f1",
+        "validation_pr_auc",
+        "validation_roc_auc",
+        "mlflow_run_id",
+        "git_commit",
+        "dataset_sha256",
+        "preprocessor_sha256",
+        "model_filename",
+        "model_sha256",
+    }
+
+    assert required_fields.issubset(metadata)
+
+    assert metadata["model_filename"] == model_path.name
+
+    assert metadata["model_sha256"] == (
+        training.file_sha256(model_path)
+    )
+
+    assert 0 <= metadata["decision_threshold"] <= 1
+
+    assert metadata["positive_class"] == 1
+
+    variant = metadata["preprocessing_variant"]
+
+    assert variant in training.VARIANTS
+
+    expected_fingerprints = (
+        training.dataset_fingerprints(
+            args.processed_dir,
+            variant,
+        )
+    )
+
+    assert (
+        metadata["dataset_sha256"]
+        == expected_fingerprints
+    )
+
+    preprocessor_path = (
+        args.preprocessor_dir
+        / f"{variant}.joblib"
+    )
+
+    assert metadata["preprocessor_sha256"] == (
+        training.file_sha256(preprocessor_path)
+    )
+
+    git_commit = metadata["git_commit"]
+
+    assert (
+        git_commit is None
+        or (
+            isinstance(git_commit, str)
+            and len(git_commit) == 40
+        )
+    )
+
+
+def test_promoted_artifacts_are_logged_to_mlflow(
+    training_workspace,
+    fast_candidates,
+    isolated_mlflow,
+):
+    """The selected MLflow run must contain promotion artifacts."""
+
+    args = training_workspace["args"]
+    args.quick = False
+
+    training.train(args)
+
+    metadata_path = (
+        args.output_dir.parent
+        / "best_model_metadata.json"
+    )
+
+    metadata = json.loads(
+        metadata_path.read_text(encoding="utf-8")
+    )
+
+    run_id = metadata["mlflow_run_id"]
+
+    client = mlflow.tracking.MlflowClient()
+
+    run = client.get_run(run_id)
+
+    assert run.info.status == "FINISHED"
+
+    assert run.data.tags["promoted"] == "true"
+
+    assert (
+        run.data.tags["model_sha256"]
+        == metadata["model_sha256"]
+    )
+
+    artifacts = client.list_artifacts(
+        run_id,
+        "promotion",
+    )
+
+    artifact_names = {
+        artifact.path.split("/")[-1]
+        for artifact in artifacts
+    }
+
+    assert "best_model_pipeline.joblib" in artifact_names
+
+    assert "best_model_metadata.json" in artifact_names
+
+
+def test_quick_training_does_not_replace_promoted_model(
+    training_workspace,
+    fast_candidates,
+    isolated_mlflow,
+):
+    """Quick experiments must preserve the existing promoted model."""
+
+    args = training_workspace["args"]
+
+    args.quick = False
+    training.train(args)
+
+    models_dir = args.output_dir.parent
+
+    model_path = (
+        models_dir / "best_model_pipeline.joblib"
+    )
+
+    metadata_path = (
+        models_dir / "best_model_metadata.json"
+    )
+
+    model_hash_before = training.file_sha256(
+        model_path
+    )
+
+    metadata_hash_before = training.file_sha256(
+        metadata_path
+    )
+
+    args.quick = True
+    training.train(args)
+
+    assert training.file_sha256(model_path) == (
+        model_hash_before
+    )
+
+    assert training.file_sha256(metadata_path) == (
+        metadata_hash_before
+    )

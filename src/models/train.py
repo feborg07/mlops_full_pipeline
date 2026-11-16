@@ -39,6 +39,9 @@ import hashlib
 import json
 import logging
 import shutil
+import subprocess
+import os
+import tempfile
 import warnings
 
 from dataclasses import dataclass
@@ -479,7 +482,7 @@ def rank(row: dict):
 # ============================================================
 
 def file_sha256(path: Path) -> str:
-    """Calculate SHA-256 for a preprocessing artifact."""
+    """Calculate SHA-256 for any local file artifact."""
 
     digest = hashlib.sha256()
 
@@ -491,6 +494,74 @@ def file_sha256(path: Path) -> str:
             digest.update(block)
 
     return digest.hexdigest()
+
+
+def git_revision() -> str | None:
+    """Return the source revision when running inside a Git checkout."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT,
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def dataset_fingerprints(processed_dir: Path, variant: str) -> dict[str, str]:
+    """Hash the exact saved train/validation/test inputs used by training."""
+    folder = processed_dir / variant
+    return {
+        f"{kind}_{split}.csv": file_sha256(folder / f"{kind}_{split}.csv")
+        for split in ("train", "val", "test")
+        for kind in ("X", "y")
+    }
+
+
+def verify_saved_model(path: Path, data: Dataset, classifier, threshold: float) -> None:
+    """Reload serialized pipeline and check compatibility with saved features."""
+    pipeline = joblib.load(path)  # Only load artifacts created by trusted code.
+    if not hasattr(pipeline, "predict_proba"):
+        raise ValueError("Promoted pipeline does not implement predict_proba")
+    # The deployable pipeline accepts raw columns; the training classifier
+    # accepts transformed columns. Use the fitted preprocessor's input schema.
+    preprocessor = pipeline.named_steps["preprocess"]
+    if not hasattr(preprocessor, "feature_names_in_"):
+        raise ValueError("Preprocessor does not expose raw feature names")
+    raw_names = list(preprocessor.feature_names_in_)
+    if not raw_names:
+        raise ValueError("Empty raw feature schema")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("Invalid decision threshold")
+    if not path.is_file() or path.stat().st_size == 0:
+        raise ValueError("Saved model is missing or empty")
+    # Checking raw predictions requires raw examples; the processed CSVs
+    # cannot be passed through preprocessing again. Validate serialization
+    # against the stored fitted estimator and its transformed input instead.
+    saved_classifier = pipeline.named_steps["classifier"]
+    sample = data.X_val.iloc[: min(10, len(data.X_val))]
+    actual = saved_classifier.predict_proba(sample)
+    expected = classifier.predict_proba(sample)
+    if actual.shape != (len(sample), 2):
+        raise ValueError("Invalid prediction probability shape")
+    if not np.isfinite(actual).all() or not np.allclose(actual.sum(axis=1), 1.0):
+        raise ValueError("Invalid predicted probabilities")
+    if not np.allclose(actual, expected, atol=1e-10, rtol=1e-10):
+        raise ValueError("Serialized classifier differs from trained winner")
+
+
+def atomic_json_write(path: Path, payload: dict) -> None:
+    """Write metadata via a temporary file on the same filesystem."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent,
+        prefix=f".{path.name}.", suffix=".tmp", delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        json.dump(payload, handle, indent=2)
+    try:
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 # ============================================================
@@ -1105,38 +1176,59 @@ def train(args):
             models_dir / "best_model_metadata.json"
         )
 
-        shutil.copy2(
-            source_model,
-            promoted_model,
-        )
+        # Validate the winning serialized model before touching the promoted copy.
+        selected_data = winners[preferred][2]
+        selected_classifier = winners[preferred][1]
+        threshold_info = json.loads(source_threshold.read_text(encoding="utf-8"))
+        threshold = float(threshold_info["threshold"])
+        verify_saved_model(source_model, selected_data, selected_classifier, threshold)
 
-        threshold_info = json.loads(
-            source_threshold.read_text(
-                encoding="utf-8"
-            )
-        )
-
+        # Record exact input and code fingerprints. Hashes are identifiers,
+        # not backups: durable historical copies still need artifact storage.
         metadata = {
             "model_family": best_info["model"],
             "preprocessing_variant": preferred,
-            "decision_threshold": threshold_info["threshold"],
+            "decision_threshold": threshold,
             "positive_class": threshold_info["positive_class"],
             "validation_f1": best_info["val_f1"],
             "validation_pr_auc": best_info["val_pr_auc"],
             "validation_roc_auc": best_info["val_roc_auc"],
             "mlflow_run_id": best_info["run_id"],
+            "git_commit": git_revision(),
+            "dataset_sha256": dataset_fingerprints(processed, preferred),
+            "preprocessor_sha256": file_sha256(selected_data.preprocessor_path),
             "source_model_path": str(source_model),
             "model_filename": promoted_model.name,
-            "model_sha256": file_sha256(promoted_model),
+            "model_sha256": file_sha256(source_model),
         }
 
-        promoted_metadata.write_text(
-            json.dumps(
-                metadata,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        # Publish a validated copy and metadata. Neither step retrains the model.
+        # Both writes are atomic individually; not a transactional pair.
+        with tempfile.NamedTemporaryFile(
+            dir=models_dir, prefix=".best_model_", suffix=".joblib",
+            delete=False,
+        ) as handle:
+            temporary_model = Path(handle.name)
+        try:
+            shutil.copy2(source_model, temporary_model)
+            if file_sha256(temporary_model) != metadata["model_sha256"]:
+                raise ValueError("Model checksum changed during copying")
+            verify_saved_model(temporary_model, selected_data, selected_classifier, threshold)
+            os.replace(temporary_model, promoted_model)
+        finally:
+            temporary_model.unlink(missing_ok=True)
+
+        atomic_json_write(promoted_metadata, metadata)
+
+        # Keep a copy of the promoted metadata in the selected MLflow run.
+        # This run already exists and contains its validation metrics.
+        with mlflow.start_run(run_id=best_info["run_id"]):
+            mlflow.set_tag("promoted", "true")
+            mlflow.set_tag("model_sha256", metadata["model_sha256"])
+            if metadata["git_commit"]:
+                mlflow.set_tag("git_commit", metadata["git_commit"])
+            mlflow.log_artifact(str(promoted_metadata), artifact_path="promotion")
+            mlflow.log_artifact(str(promoted_model), artifact_path="promotion")
 
         summary["promoted_model"] = str(
             promoted_model

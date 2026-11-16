@@ -287,7 +287,7 @@ def classify_drift(
     """
     Convert drifted-feature share into an alert level.
 
-    Critical: share > 40%
+    Critical: share > 35%
     Warning:  share > 20%
     Normal:   otherwise
     """
@@ -302,7 +302,7 @@ def classify_drift(
             "Invalid warning/critical thresholds."
         )
 
-    if drift_share > critical_threshold:
+    if drift_share >= critical_threshold:
         return "critical"
 
     if drift_share > warning_threshold:

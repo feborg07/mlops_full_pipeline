@@ -71,13 +71,19 @@ desktop.ini
 # ------------------------------------------------------------
 # 8. Trained models and artifacts
 # ------------------------------------------------------------
-/models/*
-!/models/.gitkeep
-# Allow DVC tracking files to be committed to Git.
-!/models/*.dvc
+/models/**
 
-# Allow the model-specific Git ignore file.
+# Allow Git to discover the reference directory
+!/models/reference/
+
+# Allow DVC tracking files
+!/models/*.dvc
+!/models/reference/*.dvc
+
+# Allow directory placeholders and DVC ignore files
+!/models/.gitkeep
 !/models/.gitignore
+!/models/reference/.gitignore
 
 *.pkl
 *.pickle

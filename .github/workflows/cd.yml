@@ -63,6 +63,8 @@ jobs:
           echo "=== Reference metadata ==="
           test -f models/reference/best_model_metadata.json
 
+          echo "Reference model and metadata restored successfully."
+          
       # 5. Run existing automated tests.
       - name: Run tests
         run: python -m pytest tests/ -q

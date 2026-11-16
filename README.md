@@ -1,735 +1,700 @@
 # Sprint 17 — End-to-End MLOps Pipeline
 
-An end-to-end machine learning operations (MLOps) project using the **UCI Adult Income dataset**.
+**Reproducible machine learning workflow for the UCI Adult Income classification dataset.** This educational project focuses on the *lifecycle* of a model—not merely fitting a classifier—including versioned data, reproducible preprocessing, experiment tracking, isolated training executions, explicit model promotion, drift detection, robustness evaluation, and automated tests.
 
-The project demonstrates dataset versioning, exploratory data analysis, automated preprocessing, unit testing, model experimentation, experiment tracking, and reproducible machine learning workflows.
+> **Project status (November 2026):** Core modeling, promotion, monitoring, robustness evaluation, DVC storage, and a GitHub Actions CI workflow are implemented. **GitHub Actions orchestration of the full multi-stage workflow is the next phase; it is not yet implemented.** There is no production prediction API or automatic deployment.
 
-The objective is not solely to maximize predictive performance, but to develop a structured and maintainable machine learning system.
+## Contents
 
-## Project Overview
-
-The project uses the Adult Income dataset to predict whether an individual's annual income exceeds $50,000.
-
-**Dataset characteristics:**
-
-| Property | Value |
-|---|---|
-| Dataset | UCI Adult Income |
-| Observations | 48,842 |
-| Original features | 14 |
-| Target | `income` |
-| Problem type | Binary classification |
-| Positive class | `>50K` |
-| Random seed | 42 |
-
-**Technologies:**
-
-- Python 3.11
-- Git and GitHub
-- DVC and Amazon S3
-- pandas and NumPy
-- scikit-learn
-- pytest
-- MLflow
-- joblib
-- GitHub Actions (planned)
-- Evidently (planned)
+1. [Project at a glance](#1-project-at-a-glance)
+2. [Architecture and responsibilities](#2-architecture-and-responsibilities)
+3. [Installation and reviewer quick start](#3-installation-and-reviewer-quick-start)
+4. [Dataset and exploratory analysis](#4-dataset-and-exploratory-analysis)
+5. [Preprocessing](#5-preprocessing)
+6. [Training and MLflow](#6-training-and-mlflow)
+7. [Candidate validation and explicit promotion](#7-candidate-validation-and-explicit-promotion)
+8. [DVC and artifact versioning](#8-dvc-and-artifact-versioning)
+9. [Data drift monitoring](#9-data-drift-monitoring)
+10. [Model robustness under drift](#10-model-robustness-under-drift)
+11. [Testing and existing CI](#11-testing-and-existing-ci)
+12. [Reproducing the full workflow](#12-reproducing-the-full-workflow)
+13. [Command reference](#13-command-reference)
+14. [Scope, limitations, and next steps](#14-scope-limitations-and-next-steps)
 
 ---
 
-## 1. Installation and Setup
+## 1. Project at a glance
 
-This project uses **Git** for source code versioning and **DVC (Data Version Control)** for dataset versioning.
+| Property | Value |
+|---|---|
+| Dataset | [UCI Adult (Census Income)](https://archive.ics.uci.edu/dataset/2/adult) |
+| Task | Binary classification: annual income `>50K` versus `<=50K` |
+| Observations | 48,842 combined from `adult.data` and `adult.test` |
+| Predictors | 14 original input columns; `income` is the target |
+| Positive class | `>50K` (encoded as `1` for evaluation) |
+| Approximate class distribution | 76.1% `<=50K`; 23.9% `>50K` |
+| Seed | 42 |
+| Python | 3.11 (developed with 3.11.4) |
+| Primary selection metric | Validation F1 for the positive class |
+| Selected preprocessing variant | `baseline` |
+| Selected model family | `HistGradientBoostingClassifier` |
+| Selected validation F1 | 0.7337 |
+| Selected held-out test F1 | 0.7150 |
+| Latest local test run | **451 passed, 11 warnings** (November 2026) |
 
-The raw datasets are stored in an Amazon S3 bucket configured for public read access.
+**Core tools:** Python, pandas, NumPy, scikit-learn, pytest, Git/GitHub, DVC with an Amazon S3 remote, MLflow (SQLite tracking), joblib, Evidently, and GitHub Actions.
 
-The repository and its raw datasets can be downloaded **without an AWS account or AWS credentials**.
+### Implementation status
 
-### 1.1 Prerequisites
+| Capability | Status |
+|---|---|
+| Git source control and DVC-backed raw data | Implemented |
+| Public-read S3 downloads for DVC artifacts | Implemented |
+| EDA and preprocessing variants | Implemented |
+| Automated preprocessing, training, monitoring, and robustness tests | Implemented |
+| MLflow experiment tracking and candidate isolation | Implemented |
+| Explicit, validated model promotion | Implemented |
+| DVC-versioned promoted reference model and metadata | Implemented |
+| Synthetic drift scenarios and Evidently monitoring | Implemented |
+| Robustness evaluation under drift | Implemented |
+| GitHub Actions **CI** workflow (`ci.yml`) | Implemented |
+| GitHub Actions **end-to-end workflow orchestration** | **Planned** |
+| Production model-serving endpoint / automatic deployment | Out of scope |
 
-Ensure the following tools are available:
+## 2. Architecture and responsibilities
 
-- Python 3.11
-- Git
-- pip
-- Internet connection for dependency installation and DVC downloads
+The project separates **source control**, **artifact versioning**, **experiment tracking**, and **workflow execution**. These systems solve different problems and are not interchangeable.
 
-DVC with S3 support will be installed in the project environment.
+```text
+Git / GitHub                  DVC + S3                    MLflow
+  source code, tests,          raw datasets,               candidate parameters,
+  configs, DVC pointers        reference model             metrics, run history
+         |                         |                          |
+         +-------------------------+--------------------------+
+                                   |
+                          Python entry points
+                                   |
+              raw Adult data --> preprocessing (3 variants)
+                                   |
+                      train / validation / test
+                                   |
+                        train.py + MLflow
+                                   |
+                   models/runs/<execution_id>/
+                         candidate + metadata
+                                   |
+                       promote.py (manual)
+                      validate / --confirm
+                                   |
+                      models/reference/  <--- DVC
+                                   |
+                    drift and robustness checks
 
-### 1.2 Clone the Repository
-
-Open a terminal and run:
-
-```bash
-git clone https://github.com/USERNAME/mlops_full_pipeline.git
-cd mlops_full_pipeline
+Existing: GitHub Actions CI runs automated checks.
+Next: GitHub Actions coordinates multi-stage execution.
 ```
 
-Replace `USERNAME` and the repository name with the actual GitHub repository URL.
+**Division of responsibility:**
 
-All subsequent commands should be executed from the project root.
+- **Git:** versions code, documentation, tests, configuration, and `.dvc` pointer files.
+- **DVC:** versions selected large/binary artifacts and retrieves their exact contents from S3. In this project, DVC is **not** the workflow orchestrator.
+- **MLflow:** records candidate experiments and associated metrics/artifacts. Local MLflow history is not automatically shared with GitHub clones.
+- **Python modules:** implement preprocessing, model training, drift detection, robustness evaluation, and promotion.
+- **GitHub Actions:** already runs CI checks; the planned extension will orchestrate stages without automatically promoting models.
 
-### 1.3 Create a Virtual Environment
+### Main project paths
 
-Create an isolated Python environment:
+```text
+.github/workflows/ci.yml       Existing continuous-integration workflow
+scripts/run_preprocessing.py   Preprocessing entry point
+src/data/preprocess.py         Loading, splitting, transformations
+src/data/monitoring.py         Evidently drift detection
+src/models/train.py            Model sweep and MLflow logging
+src/models/promote.py          Explicit candidate validation/promotion
+src/models/robustness.py       Evaluation under synthetic drift
+tests/                         pytest test suite
+data/raw/                      DVC-retrieved Adult data
+data/processed/<variant>/      Generated training/validation/test partitions
+data/drift/<scenario>/         Generated control/mild/moderate/severe datasets
+models/preprocessors/          Fitted preprocessing artifacts
+models/runs/<execution_id>/    Isolated experiment output
+models/reference/              DVC-tracked promoted model and metadata
+models/reference.dvc           Git-tracked pointer for reference directory
+reports/drift/                 Generated drift reports
+reports/robustness/            Generated robustness reports (ignored by Git)
+mlflow.db                      Local MLflow SQLite tracking store
+```
+
+Generated paths may not exist in a fresh clone until their corresponding stage runs. The exact tree can evolve as orchestration is added.
+
+## 3. Installation and reviewer quick start
+
+### 3.1 Prerequisites
+
+- Python 3.11, Git, pip, and internet access.
+- Access to the project's GitHub repository.
+- No AWS credentials are required **for the configured public-read DVC downloads**. Writing to the S3 remote requires separate permissions.
+
+### 3.2 Clone the repository
+
+```bash
+git clone <ACTUAL_REPOSITORY_URL>
+cd mlops-final-project
+```
+
+**Maintainer action:** Replace `<ACTUAL_REPOSITORY_URL>` with the real repository URL before publishing this README. The previous README contained an unverified placeholder repository address.
+
+All commands below assume the terminal is in the repository root.
+
+### 3.3 Create and activate a virtual environment
 
 ```bash
 python -m venv .venv
 ```
 
-Activate the environment.
-
-**Windows (Git Bash):**
+Windows Git Bash:
 
 ```bash
 source .venv/Scripts/activate
 ```
 
-**Windows (PowerShell):**
+Windows PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-**macOS / Linux:**
+macOS/Linux:
 
 ```bash
 source .venv/bin/activate
 ```
 
-### 1.4 Install Dependencies
-
-Upgrade pip:
+### 3.4 Install dependencies
 
 ```bash
 python -m pip install --upgrade pip
-```
-
-Install the project's Python dependencies:
-
-```bash
 python -m pip install -r requirements.txt
-```
-
-Ensure DVC's S3 integration is installed:
-
-```bash
 python -m pip install "dvc[s3]"
 ```
 
-### 1.5 Download the Raw Dataset
+The last command ensures that the DVC installation supports S3. Dependency availability and exact behavior may differ across platforms.
 
-The raw dataset is tracked by DVC and stored remotely in Amazon S3.
-
-Download it using:
+### 3.5 Retrieve DVC-managed artifacts
 
 ```bash
 dvc pull
 ```
 
-DVC retrieves the dataset version referenced by the repository's DVC metadata.
+This restores the DVC-tracked inputs and reference artifacts associated with the checked-out Git revision, including the raw Adult files and the promoted reference model, assuming the configured S3 objects remain available.
 
-The required files include:
-
-```text
-data/raw/
-├── adult.data
-└── adult.test
-```
-
-Additional files may be present in the DVC-tracked raw data directory.
-
-**Note:** The S3 remote permits anonymous downloads of the configured dataset objects. Uploading or modifying remote data requires appropriate AWS permissions.
-
----
-
-## 2. Preprocessing Pipeline and Testing
-
-The project includes a configurable preprocessing pipeline for the **UCI Adult Income dataset**, with automated unit tests implemented using **pytest**.
-
-The preprocessing module handles:
-
-- Loading and combining raw datasets
-- Data cleaning and validation
-- Missing-value handling
-- Feature engineering
-- Numerical transformations and scaling
-- Categorical encoding
-- Train/validation/test splitting
-- Serialization of fitted preprocessing transformers
-
-Learned preprocessing transformations are fitted using the training partition and applied to the validation and test partitions.
-
-### 2.1 Run Preprocessing Unit Tests
-
-The preprocessing tests are located in the `tests/` directory.
+Expected raw inputs include:
 
 ```text
-tests/
-├── conftest.py
-└── test_preprocessing.py
+data/raw/adult.data
+data/raw/adult.test
 ```
 
-The `conftest.py` file provides reusable pytest fixtures.
-
-The `test_preprocessing.py` module tests preprocessing functionality and expected behavior.
-
-Run the preprocessing tests:
-
-```bash
-python -m pytest tests/test_preprocessing.py -v
-```
-
-The `-v` flag enables verbose output.
-
-Run the entire test suite:
-
-```bash
-python -m pytest tests/ -v
-```
-
-**Expected result:** All implemented tests should pass.
-
-Passing unit tests verifies the tested behavior but does not guarantee that the complete pipeline will execute successfully on the full dataset.
-
-### 2.2 Run the Preprocessing Pipeline
-
-Before running preprocessing, download the raw data:
-
-```bash
-dvc pull
-```
-
-The preprocessing runner is located at:
+The reference directory contains:
 
 ```text
-scripts/run_preprocessing.py
+models/reference/best_model_pipeline.joblib
+models/reference/best_model_metadata.json
 ```
 
-The pipeline supports three configurations:
-
-| Configuration | Description |
-|---|---|
-| `baseline` | Standard numerical scaling, logarithmic capital transformations, and categorical encoding |
-| `robust` | Robust numerical scaling and retention of original and logarithmic capital features |
-| `interactions` | Standard preprocessing with additional engineered feature interactions |
-
-**Run all configurations:**
+### 3.6 Fast verification
 
 ```bash
+python -m pytest tests/ -q
+dvc status
+```
+
+The last recorded complete local run passed **451 tests with 11 third-party deprecation warnings**. This is a historical result, not a guarantee of the same count or runtime on another checkout.
+
+> **Security:** `joblib`/pickle model files can execute code when loaded. Only load model artifacts from a trusted repository and storage source. Public readability does not imply that arbitrary external artifacts are safe.
+
+## 4. Dataset and exploratory analysis
+
+### 4.1 Source and target
+
+The project combines UCI's original `adult.data` (32,561 rows) and `adult.test` (16,281 rows) into a single dataset of **48,842 rows**. The first line of `adult.test` is skipped, trailing periods are removed from its income labels, and missing categorical values marked `?` are interpreted as missing.
+
+The original UCI train/test division is **not** reused. The project creates its own partitions for training, validation, and held-out evaluation.
+
+The original predictors are `age`, `workclass`, `fnlwgt`, `education`, `education-num`, `marital-status`, `occupation`, `relationship`, `race`, `sex`, `capital-gain`, `capital-loss`, `hours-per-week`, and `native-country`.
+
+### 4.2 Key EDA findings
+
+- The target is imbalanced: approximately **76.1%** of records are `<=50K` and **23.9%** are `>50K`.
+- Missingness is concentrated in `workclass` (~5.73%), `occupation` (~5.75%), and `native-country` (~1.75%).
+- `capital-gain` and `capital-loss` are strongly zero-inflated, motivating logarithmic transformations and positive-value indicators.
+- `education-num`, `hours-per-week`, and `age` showed meaningful relationships with the target in the initial exploratory analysis.
+- Exact duplicate rows are **retained**. Identical demographic/financial records can represent distinct people; duplicate-aware partitioning is intended to reduce cross-partition leakage.
+
+The dataset contains sensitive demographic variables and represents historical census data. Predictive associations are **not causal findings** and should not be interpreted as a basis for consequential decisions about individuals.
+
+## 5. Preprocessing
+
+### 5.1 Entry point
+
+```bash
+# Generate all supported variants
 python -m scripts.run_preprocessing
-```
 
-If the installed runner supports configuration selection, individual configurations can be executed using:
-
-**Baseline:**
-
-```bash
+# Generate a single variant
 python -m scripts.run_preprocessing --config baseline
-```
-
-**Robust:**
-
-```bash
 python -m scripts.run_preprocessing --config robust
-```
-
-**Interactions:**
-
-```bash
 python -m scripts.run_preprocessing --config interactions
 ```
 
-**Important:** Individual configuration commands require the runner to implement the `--config` argument. If the argument is accepted but ignored, all configurations may execute.
+The runner reads the two raw input files, validates and combines them, creates partitions, fits transformations on training data, and writes processed artifacts.
 
-### 2.3 Dataset Splitting Strategy
+### 5.2 Variants
 
-The preprocessing workflow combines the original UCI `adult.data` and `adult.test` files before creating new dataset partitions.
+| Variant | Main behavior |
+|---|---|
+| `baseline` | Median numerical imputation, standard scaling, categorical encoding, `log1p` capital features and positive-capital indicators |
+| `robust` | Robust scaling; retains original and logarithmic capital representations |
+| `interactions` | Baseline transformations plus engineered interaction features |
 
-The original UCI train/test separation is therefore not preserved.
+Categorical missing values are represented as `Unknown`. The textual `education` column is excluded from the baseline model representation while `education-num` is retained. Categorical features use one-hot encoding with handling for infrequent/unseen categories.
 
-The combined dataset contains 48,842 observations.
+### 5.3 Partitioning and leakage controls
 
-The workflow uses three partitions:
+The project creates **train, validation, and test** partitions with a fixed random seed and class stratification. Duplicate records are retained, with duplicate-aware splitting logic to limit leakage between partitions.
 
-| Partition | Percentage | Purpose |
-|---|---:|---|
-| Training | 60% | Fit preprocessing transformations and machine learning models |
-| Validation | 20% | Select models, hyperparameters, and classification thresholds |
-| Testing | 20% | Evaluate selected models on held-out data |
+- **Training:** fit preprocessing parameters and classifiers.
+- **Validation:** compare candidates and optimize decision thresholds.
+- **Test:** evaluate selected configuration winners without using test metrics to choose the preferred configuration.
 
-The splitting procedure uses a fixed random seed (`random_state=42`) for reproducibility.
+Learned transformations must be fitted on training data only. The training module consumes the saved partitions rather than silently recreating them.
 
-Duplicate observations are preserved by default because identical records may represent different individuals.
+### 5.4 Generated files
 
-The preprocessing workflow uses a duplicate-aware splitting strategy intended to prevent identical feature records from appearing across different partitions.
-
-### 2.4 Generated Datasets and Artifacts
-
-The pipeline generates processed datasets separately for each configuration.
+For each variant, the preprocessing runner produces:
 
 ```text
-data/processed/
-├── baseline/
-│   ├── X_train.csv
-│   ├── y_train.csv
-│   ├── X_val.csv
-│   ├── y_val.csv
-│   ├── X_test.csv
-│   ├── y_test.csv
-│   └── preprocessing_config.json
-├── robust/
-│   ├── X_train.csv
-│   ├── y_train.csv
-│   ├── X_val.csv
-│   ├── y_val.csv
-│   ├── X_test.csv
-│   ├── y_test.csv
-│   └── preprocessing_config.json
-└── interactions/
-    ├── X_train.csv
-    ├── y_train.csv
-    ├── X_val.csv
-    ├── y_val.csv
-    ├── X_test.csv
-    ├── y_test.csv
-    └── preprocessing_config.json
+data/processed/<variant>/
+    X_train.csv      y_train.csv
+    X_val.csv        y_val.csv
+    X_test.csv       y_test.csv
+    preprocessing_config.json
 
-models/preprocessors/
-├── baseline.joblib
-├── robust.joblib
-└── interactions.joblib
+models/preprocessors/<variant>.joblib
 ```
 
-**Generated files:**
+Processed datasets and fitted transformers are generated artifacts; do not assume that all of them are DVC-tracked or committed to Git. Re-run preprocessing when they are absent.
 
-| Artifact | Description |
-|---|---|
-| `X_train.csv` | Transformed training features |
-| `y_train.csv` | Training target labels |
-| `X_val.csv` | Transformed validation features |
-| `y_val.csv` | Validation target labels |
-| `X_test.csv` | Transformed testing features |
-| `y_test.csv` | Testing target labels |
-| `preprocessing_config.json` | Preprocessing configuration metadata |
-| `<variant>.joblib` | Serialized fitted preprocessing transformer |
+## 6. Training and MLflow
 
-The three configurations produce different feature representations of the same classification problem.
+### 6.1 Candidate families and search
 
-The generated processed datasets and fitted preprocessors are used directly by the model-training module.
+The training module evaluates four model families across three preprocessing variants:
 
-### 2.5 Reproducibility and Leakage Prevention
-
-The preprocessing workflow separates data partitioning from learned feature transformations.
-
-The intended guarantees are:
-
-1. Data partitions are generated before learned transformations are fitted.
-2. Imputation, scaling, and encoding parameters are learned from training data only.
-3. Validation and test observations are transformed using the fitted training preprocessor.
-4. The model-training module consumes saved partitions rather than recreating them.
-5. The held-out test set is not used to select models or classification thresholds.
-
-For future cross-validation experiments, an unfitted preprocessing transformer should be included within each cross-validation fold to prevent validation leakage.
-
----
-
-## 3. Model Training and Experiment Tracking
-
-The project includes a machine learning training module using **scikit-learn** and **MLflow**.
-
-The training module is located at:
-
-```text
-src/models/train.py
-```
-
-It uses the processed datasets and fitted preprocessing artifacts generated during the previous stage.
-
-**The training module does not reload the raw Adult Income dataset, regenerate dataset partitions, or refit the saved preprocessing transformers.**
-
-### 3.1 Machine Learning Models
-
-Four classification algorithms are evaluated:
-
-| Model | Description |
-|---|---|
-| Logistic Regression | Linear probabilistic classification model |
-| Random Forest | Ensemble of decision trees using bootstrap aggregation |
-| HistGradientBoosting | Histogram-based gradient-boosted decision trees |
-| Extra Trees | Ensemble of highly randomized decision trees |
-
-Each algorithm is evaluated using multiple hyperparameter configurations.
-
-Logistic Regression includes an additional model-specific `StandardScaler` to improve numerical optimization.
-
-This scaler is fitted exclusively using the training partition.
-
-### 3.2 Experiment Configurations
-
-The full training workflow evaluates:
-
-| Model | Candidates per preprocessing variant |
+| Family | Full candidates per variant |
 |---|---:|
 | Logistic Regression | 6 |
 | Random Forest | 4 |
 | HistGradientBoosting | 4 |
 | Extra Trees | 4 |
-| **Total** | **18** |
+| **Total per variant** | **18** |
 
-Because three preprocessing configurations are evaluated:
+A full execution evaluates **54 candidates** across all variants. Logistic Regression uses an additional model-specific scaler fitted on training data.
 
-**18 candidates × 3 configurations = 54 training experiments**
-
-The experiment search is intentionally limited in scope because the project's primary objective is to demonstrate an end-to-end MLOps workflow rather than exhaustive hyperparameter optimization.
-
-### 3.3 Run a Quick Training Experiment
-
-A quick mode is available to verify that the training workflow executes successfully.
+### 6.2 Quick versus full execution
 
 ```bash
+# Development/smoke test: 12 candidates, validation only
 python -m src.models.train --quick
-```
 
-Quick mode:
-
-- Evaluates one candidate from each model family.
-- Runs across all three preprocessing configurations.
-- Trains 12 candidate models.
-- Calculates validation metrics.
-- Selects a validation winner for each configuration.
-- Saves training artifacts.
-- Does not evaluate the held-out test sets.
-
-Quick mode is intended for development and pipeline verification.
-
-### 3.4 Run the Full Training Experiment
-
-Execute the complete experiment sweep:
-
-```bash
+# Full experiment: 54 candidates, test evaluation of winners,
+# and a promotable candidate model
 python -m src.models.train
 ```
 
-The full workflow:
+**Quick mode** trains one configuration from each model family for each preprocessing variant. It produces validation results and a quick summary, but **does not produce a promotable reference candidate** and does not evaluate the held-out test partitions.
 
-1. Loads the previously generated training, validation, and test partitions.
-2. Trains 54 candidate models.
-3. Generates validation probabilities.
-4. Optimizes classification thresholds using validation data.
-5. Calculates validation metrics.
-6. Selects the best candidate for each preprocessing configuration.
-7. Evaluates the three configuration winners on their held-out test sets.
-8. Saves the trained model pipelines and selected thresholds.
-9. Records experiment metrics and metadata using MLflow.
+**Full mode** evaluates all 54 candidates, selects a winner for each variant using validation results, evaluates those winners on the held-out test sets, and saves an isolated candidate and its metadata. Training does **not** automatically replace the promoted reference model.
 
-### 3.5 Model Selection Strategy
+### 6.3 Selection policy
 
-Model selection is based on validation performance.
+The primary selection criterion is **positive-class validation F1**, with average precision (PR-AUC) and ROC-AUC available as additional ranking information. The decision threshold is optimized on validation predictions, not the test set.
 
-The ranking criteria are:
+The preferred preprocessing configuration is selected using **validation results**, even if another variant has a slightly higher test F1. This avoids using the held-out test set for model selection.
 
-1. F1 score
-2. Average precision (PR-AUC)
-3. ROC-AUC
+### 6.4 Recorded results
 
-The F1 score is the primary selection metric because the dataset has an imbalanced target distribution.
+The completed 54-candidate execution selected HistGradientBoosting for all three variants:
 
-The positive class (`>50K`) represents approximately 24% of observations.
-
-For each candidate, the decision threshold is optimized using the validation partition.
-
-The selected threshold is saved with the winning model's artifacts.
-
-**Important:** The held-out test set is not used to optimize thresholds or select the preferred configuration.
-
-Although the workflow reports test results for each configuration winner, the preferred configuration is determined by validation metrics.
-
-### 3.6 Model Evaluation Metrics
-
-The training workflow calculates:
-
-| Metric | Purpose |
-|---|---|
-| Accuracy | Overall proportion of correct predictions |
-| Precision | Proportion of positive predictions that are correct |
-| Recall | Proportion of actual positive cases identified |
-| F1 score | Harmonic mean of precision and recall |
-| Average precision | Summarizes precision–recall performance across thresholds |
-| ROC-AUC | Measures ranking discrimination across thresholds |
-| Confusion matrix | Counts true negatives, false positives, false negatives, and true positives |
-
-The classification threshold is optimized to maximize validation F1.
-
-Threshold-independent ranking metrics are also recorded to provide a broader evaluation of model behavior.
-
-### 3.7 Training Results
-
-The completed 54-candidate experiment selected **HistGradientBoosting** as the winning model family for all three preprocessing configurations.
-
-| Configuration | Validation F1 | Test F1 | Test ROC-AUC |
+| Variant | Validation F1 | Test F1 | Test ROC-AUC |
 |---|---:|---:|---:|
-| Baseline | **0.7337** | 0.7150 | **0.9247** |
+| **Baseline (selected)** | **0.7337** | 0.7150 | **0.9247** |
 | Robust | **0.7337** | 0.7150 | **0.9247** |
 | Interactions | 0.7314 | **0.7192** | 0.9240 |
 
-**Preferred configuration:** `baseline`
+The selected baseline candidate uses a validation-optimized threshold of approximately **0.3713**. These are recorded results for a particular execution, not universal performance guarantees.
 
-The baseline configuration achieved the highest validation F1, tied with robust preprocessing.
+### 6.5 Isolated execution artifacts
 
-The interactions configuration achieved a slightly higher test F1, but this result was not used to change the validation-based model selection.
-
-The differences between configurations are small and do not establish a statistically significant performance advantage.
-
-### 3.8 Generated Training Artifacts
-
-The training workflow saves its results under:
+Each invocation receives a distinct 32-character hexadecimal `execution_id`:
 
 ```text
-models/training/
-├── sweep_leaderboard.csv
-├── training_summary.json
-├── quick_training_summary.json
-├── baseline/
-│   ├── model_pipeline.joblib
-│   └── decision_threshold.json
-├── robust/
-│   ├── model_pipeline.joblib
-│   └── decision_threshold.json
-└── interactions/
-    ├── model_pipeline.joblib
-    └── decision_threshold.json
+models/runs/<execution_id>/
+    sweep_leaderboard.csv
+    training_summary.json              # full execution
+    quick_training_summary.json        # quick execution
+    best_model_pipeline.joblib         # full execution only
+    best_model_metadata.json           # full execution only
+    baseline/...
+    robust/...
+    interactions/...
 ```
 
-**Artifacts:**
+The full-training metadata records the chosen model family, preprocessing variant, decision threshold, MLflow run ID, execution ID, input-dataset hashes, preprocessing hash, and model SHA-256. The training summary records the execution's candidate counts, completion status, winners, and evaluation results.
 
-| File | Description |
-|---|---|
-| `sweep_leaderboard.csv` | Candidate experiment results and validation metrics |
-| `training_summary.json` | Full experiment summary, winning models, and test metrics |
-| `quick_training_summary.json` | Summary of the most recent quick experiment |
-| `model_pipeline.joblib` | Fitted preprocessor combined with the selected fitted classifier |
-| `decision_threshold.json` | Validation-optimized classification threshold |
+**Example full execution:** `ad7990374a3f453b9d879498349f714f`. This identifier documents the recorded experiment; a reviewer running training will generate a **different** ID.
 
-The saved model pipelines are intended to support inference from raw feature records.
+### 6.6 MLflow
 
-End-to-end raw-input inference should be tested before treating these artifacts as production-ready.
-
-### 3.9 MLflow Experiment Tracking
-
-MLflow records the machine learning experiments.
-
-The local tracking configuration uses:
-
-```text
-mlflow.db
-mlartifacts/
-```
-
-The SQLite database stores experiment metadata and metrics, while the artifact directory stores logged files.
-
-To display the MLflow UI command:
+The project uses a local SQLite tracking database (`mlflow.db`) and local logged artifacts. To obtain the configured UI command:
 
 ```bash
 python -m src.models.train --show-mlflow-command
 ```
 
-The command prints the appropriate MLflow launch command for the configured tracking database.
+Run the printed command, then open the address it displays (commonly `http://127.0.0.1:5000`). MLflow allows comparison of parameters, metrics, convergence diagnostics, and experiment runs.
 
-Run the displayed command, then open:
+**Important:** A fresh clone does not automatically include the maintainer's local MLflow database or all isolated training executions. Re-run training to regenerate local experiment history.
 
-```text
-http://127.0.0.1:5000
-```
+## 7. Candidate validation and explicit promotion
 
-The MLflow interface allows users to:
+Training and promotion are intentionally separate operations. A successful training run is **not** automatically the reference model.
 
-- Compare candidate experiments.
-- Inspect model hyperparameters.
-- Review validation and test metrics.
-- Identify winning configurations.
-- Inspect convergence diagnostics.
-- Access logged model artifacts.
-
-**Note:** Local MLflow runs are not automatically shared when cloning the GitHub repository. A reviewer can regenerate the experiment history by executing the training workflow.
-
----
-
-## 4. Data and Artifact Versioning
-
-### 4.1 Source Code Versioning
-
-Git tracks the project's source code and configuration files.
-
-GitHub provides the remote repository for collaboration and code review.
-
-Typical commands include:
+### 7.1 Dry-run validation
 
 ```bash
-git status
-git add .
-git commit -m "feat: implement model training and MLflow tracking"
+python -m src.models.promote --run-id <FULL_EXECUTION_ID>
+```
+
+The dry run checks the candidate without modifying `models/reference/`. The validator checks, among other things:
+
+- Matching candidate and summary execution IDs.
+- Existence of `training_summary.json` with `quick: false`.
+- Positive candidate count and all candidates reported successful.
+- Agreement between the preferred variant and candidate metadata.
+- Matching winning MLflow run ID and `FINISHED` status.
+- Candidate SHA-256 integrity.
+- A finite decision threshold in the valid range.
+- A loadable, trusted classifier pipeline with `predict_proba()` and positive class `1`.
+
+Example result:
+
+```json
+{
+  "execution_id": "<FULL_EXECUTION_ID>",
+  "candidate_sha256": "<SHA256>",
+  "validated": true,
+  "promoted": false
+}
+```
+
+### 7.2 Explicit promotion
+
+Only after reviewing the validation result:
+
+```bash
+python -m src.models.promote --run-id <FULL_EXECUTION_ID> --confirm
+```
+
+Promotion writes the selected candidate to:
+
+```text
+models/reference/
+    best_model_pipeline.joblib
+    best_model_metadata.json
+```
+
+Reference metadata additionally records promotion time, promotion source, and explicit promotion type. Source candidate files remain in their isolated run directory.
+
+The implementation backs up existing reference artifacts and attempts rollback if an exception occurs during replacement. **The model and metadata are two files, so the replacement is not a single atomic transaction; abrupt process termination may leave an inconsistent pair.** Treat promotion as an explicitly controlled operation, not a fully transactional deployment.
+
+### 7.3 Persist the promoted reference with DVC
+
+After promotion:
+
+```bash
+dvc add models/reference
+dvc push
+git add models/reference.dvc models/.gitignore
+git commit -m "feat: update promoted reference model"
 git push
 ```
 
-Generated artifacts should be reviewed against `.gitignore` before staging changes.
+`models/reference.dvc` tracks the **directory as one DVC object**, including the model and its metadata. Git tracks the pointer, while S3 stores the artifact contents. DVC may report `Everything is up to date` when all required objects already exist remotely.
 
-### 4.2 Dataset Versioning with DVC
+**Do not run `git add -f` on the binary model or commit it directly to Git.** If Git reports that the directory is already tracked, inspect existing tracking before changing the index; the project has already migrated from individual `.dvc` pointers to a directory-level pointer.
 
-DVC manages the raw datasets stored remotely in Amazon S3.
+## 8. DVC and artifact versioning
 
-The DVC metadata records which dataset version should be downloaded.
-
-To retrieve the dataset:
+### 8.1 Retrieve a specific version
 
 ```bash
+git checkout <COMMIT_OR_TAG>
 dvc pull
+dvc status
 ```
 
-To inspect the configured remotes:
+The Git revision selects the `.dvc` pointers; DVC retrieves the corresponding content from the remote. Exact recovery depends on those objects still existing in S3.
+
+### 8.2 Inspect the remote and local status
 
 ```bash
 dvc remote list
+dvc status
+git status
 ```
 
-### 4.3 Generated Artifacts
+The configured S3 remote supports anonymous **reads** of designated objects. Uploading requires suitable credentials/permissions. Never commit AWS access keys or other secrets.
 
-The preprocessing and training stages generate additional files locally.
+### 8.3 What is and is not versioned
 
-These include:
+| Artifact | Storage/versioning policy |
+|---|---|
+| Python source, tests, README, workflows | Git |
+| Raw Adult data | DVC + S3 |
+| Promoted `models/reference/` directory | DVC + S3; pointer in Git |
+| Per-execution training candidates | Generated locally; not automatically promoted or uploaded |
+| Processed datasets / fitted preprocessors | Generated by preprocessing; check individual DVC tracking before assuming persistence |
+| Local MLflow SQLite database/artifacts | Local; not automatically shared |
+| Drift and robustness reports | Generated locally; not automatically versioned |
 
-- Processed train/validation/test datasets
-- Fitted preprocessing transformers
-- Trained classification pipelines
-- Decision threshold configurations
-- Experiment leaderboards and summaries
-- MLflow tracking data
+**DVC does not currently orchestrate the stages.** GitHub Actions is the chosen orchestrator for the next development phase. There is no requirement to introduce `dvc.yaml` solely to use DVC for artifact versioning.
 
-These files are **not automatically uploaded to S3 or tracked by DVC** merely because they are generated.
+## 9. Data drift monitoring
 
-The current workflow expects reviewers to regenerate these artifacts by running preprocessing and training.
+### 9.1 Synthetic scenarios
 
-Generated datasets and model artifacts can be added to DVC tracking later if persistent artifact versioning is required.
+The project generates controlled feature shifts to evaluate detection and model sensitivity:
 
-A future `dvc.yaml` pipeline could also formalize stage dependencies and provide reproducible execution through DVC.
+| Scenario | Approximate intervention level | Purpose |
+|---|---|---|
+| `control` | No injected drift | Baseline comparison |
+| `mild` | Small shifts | Low-severity perturbation |
+| `moderate` | Intermediate shifts | Warning-level change |
+| `severe` | Large shifts | Critical-level change |
 
----
+Generated labeled scenarios are stored under `data/drift/<scenario>/`, typically as `X_test.csv` and `y_test.csv`. These scenarios are synthetic stress tests, not observed production traffic.
 
-## 5. Reproducing the Complete Workflow
-
-After cloning the repository, a reviewer can reproduce the current implemented workflow by following these steps.
-
-### Step 1 — Activate the Environment
+### 9.2 Run monitoring
 
 ```bash
-source .venv/Scripts/activate
+python -m src.data.monitoring
 ```
 
-The example above is for Windows Git Bash. Use the activation command appropriate for the operating system.
+Monitoring uses Evidently to compare feature distributions and reports the share of drifted columns. The configured status policy is:
 
-### Step 2 — Install Dependencies
+| Share of drifted columns | Status |
+|---|---|
+| `<= 20%` | `NORMAL` |
+| `> 20%` and `< 35%` | `WARNING` |
+| `>= 35%` | `CRITICAL` |
+
+### 9.3 Recorded monitoring outcome
+
+| Scenario | Drifted columns | Share | Status |
+|---|---:|---:|---|
+| Mild | 0 / 14 | 0.00% | NORMAL |
+| Moderate | 3 / 14 | 21.43% | WARNING |
+| Severe | 5 / 14 | 35.71% | CRITICAL |
+
+The recorded overall status was **CRITICAL** because the severe scenario crossed the configured threshold. Reports are generated under `reports/drift/`.
+
+**Interpretation:** Drift is a change in input distribution, not direct proof that predictive performance has degraded. Robustness evaluation addresses the latter question using labeled synthetic scenarios.
+
+## 10. Model robustness under drift
+
+### 10.1 Purpose
+
+Robustness evaluation loads the **promoted reference model** and its saved decision threshold, applies it to labeled control and drifted datasets, and compares predictive metrics against the control scenario.
+
+It reports accuracy, balanced accuracy, precision, recall, F1, ROC-AUC, and PR-AUC, as applicable. Robustness analysis is separate from drift detection: a feature can drift without causing a large metric change, and a metric can degrade even when a chosen drift detector does not flag a shift.
+
+### 10.2 Run the evaluation
+
+After generating the drift datasets, run:
+
+```bash
+python -m src.models.robustness \
+  --control data/drift/control/X_test.csv \
+  --control-target data/drift/control/y_test.csv \
+  --mild data/drift/mild/X_test.csv \
+  --mild-target data/drift/mild/y_test.csv \
+  --moderate data/drift/moderate/X_test.csv \
+  --moderate-target data/drift/moderate/y_test.csv \
+  --severe data/drift/severe/X_test.csv \
+  --severe-target data/drift/severe/y_test.csv
+```
+
+The example uses Bash line continuation (`\`). On PowerShell, use a single line or replace the continuation syntax appropriately.
+
+### 10.3 Recorded robustness results
+
+| Scenario | F1 (positive class) | Change versus control |
+|---|---:|---:|
+| Control | 0.7150 | — |
+| Mild | 0.7124 | −0.0026 |
+| Moderate | 0.6807 | −0.0343 |
+| Severe | 0.5525 | −0.1625 |
+
+These values are from a recorded run; results depend on the reference model and the generated drift datasets. The severe scenario showed substantial F1 degradation, consistent with the monitoring alert. Reports are written under `reports/robustness/` and are not currently committed to Git.
+
+## 11. Testing and existing CI
+
+### 11.1 Run tests locally
+
+```bash
+# Full suite
+python -m pytest tests/ -q
+
+# Individual modules
+python -m pytest tests/test_preprocessing.py -v
+python -m pytest tests/test_train.py -v
+python -m pytest tests/test_promote.py -v
+python -m pytest tests/test_monitoring.py -v
+python -m pytest tests/test_robustness.py -v
+```
+
+Test coverage includes preprocessing behavior and duplicate preservation; model training and selection; candidate validation and promotion safeguards; drift monitoring; synthetic drift generation; and robustness evaluation.
+
+The latest reported full run was:
+
+```text
+451 passed, 11 warnings in 123.17s
+```
+
+The warnings were deprecation notices from third-party dependencies (Evidently/NumPy, Litestar, and MLflow/SQLAlchemy). Passing tests do not prove absence of all data leakage, fairness issues, or deployment failures.
+
+### 11.2 GitHub Actions: implemented versus planned
+
+The repository already contains `.github/workflows/ci.yml` for CI testing. A separate `retrain.yml` was intentionally removed. **Do not interpret the presence of CI as proof that full preprocessing, training, drift monitoring, robustness evaluation, or model promotion are currently orchestrated in GitHub Actions.**
+
+The next phase will define an orchestrated workflow with explicit stage ordering, artifact handling, failure behavior, and permissions. Model promotion should remain an **explicitly authorized** action rather than an automatic consequence of a passing training job.
+
+## 12. Reproducing the full workflow
+
+The following is a **manual, ordered reproduction guide**. It is not yet a single GitHub Actions pipeline.
+
+**A. Set up and retrieve versioned artifacts**
 
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install "dvc[s3]"
-```
-
-### Step 3 — Download Raw Data
-
-```bash
 dvc pull
 ```
 
-### Step 4 — Run Unit Tests
+**B. Validate the repository**
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -q
 ```
 
-### Step 5 — Generate Processed Datasets
+**C. Regenerate preprocessing outputs**
 
 ```bash
 python -m scripts.run_preprocessing
 ```
 
-This generates the train, validation, and test partitions and saves the fitted preprocessing transformers.
-
-### Step 6 — Verify Training with Quick Mode
+**D. Smoke-test training, then run the full sweep if desired**
 
 ```bash
 python -m src.models.train --quick
-```
-
-This checks that model training and validation work using the generated preprocessing artifacts.
-
-### Step 7 — Execute the Full Model Training
-
-```bash
 python -m src.models.train
 ```
 
-This evaluates the full candidate search and produces the final training summary.
-
-### Step 8 — Inspect the Experiment Results
+Record the new `execution_id` printed by the full run. Review its summary, metrics, and metadata. To validate without changing the reference:
 
 ```bash
-python -m src.models.train --show-mlflow-command
+python -m src.models.promote --run-id <NEW_FULL_EXECUTION_ID>
 ```
 
-Run the printed MLflow UI command and inspect the experiment results.
+**E. Evaluate drift and robustness**
 
-**Reproducibility note:** The random seed and saved preprocessing configuration support reproducibility. Exact numerical results can also depend on dependency versions, numerical libraries, and execution environment.
+Generate the control/mild/moderate/severe drift datasets using the project's drift-generation entry point, then run:
+
+```bash
+python -m src.data.monitoring
+```
+
+Use the full robustness command in [Section 10](#10-model-robustness-under-drift). The reference model downloaded with `dvc pull` can be used for these checks; a newly trained candidate is **not** used until explicitly promoted.
+
+**F. Optional: promote a new candidate**
+
+```bash
+python -m src.models.promote --run-id <NEW_FULL_EXECUTION_ID> --confirm
+dvc add models/reference
+dvc push
+```
+
+Promotion and pushing to the shared remote are **maintainer operations**, not required for a reviewer who only wants to reproduce experiments. Do not promote a new candidate merely to verify that training works.
+
+### Reproducibility boundaries
+
+- Fixed seeds and DVC pointers help reproduce inputs and processing, but do not guarantee bit-for-bit identical models across every platform/library version.
+- MLflow run IDs and training execution IDs are generated anew for each run.
+- Full training can be more expensive than quick mode.
+- The local MLflow database and generated reports are not part of the versioned reference artifact by default.
+- The reference model represents an explicitly promoted snapshot, not automatically the most recently trained candidate.
+
+## 13. Command reference
+
+| Task | Command |
+|---|---|
+| Download DVC-managed data and model | `dvc pull` |
+| Check DVC status | `dvc status` |
+| Run all tests | `python -m pytest tests/ -q` |
+| Run preprocessing | `python -m scripts.run_preprocessing` |
+| Run one preprocessing variant | `python -m scripts.run_preprocessing --config baseline` |
+| Quick training | `python -m src.models.train --quick` |
+| Full training | `python -m src.models.train` |
+| Display MLflow launch command | `python -m src.models.train --show-mlflow-command` |
+| Validate candidate | `python -m src.models.promote --run-id <ID>` |
+| Promote candidate | `python -m src.models.promote --run-id <ID> --confirm` |
+| Generate drift monitoring report | `python -m src.data.monitoring` |
+| Evaluate robustness | See [Section 10](#10-model-robustness-under-drift) |
+| Update reference DVC pointer | `dvc add models/reference` |
+| Upload DVC objects (authorized writers) | `dvc push` |
+
+## 14. Scope, limitations, and next steps
+
+### Implemented engineering controls
+
+- Separate training, validation, and test responsibilities.
+- Explicit candidate selection by validation metrics.
+- SHA-256 and provenance checks for model promotion.
+- Manual confirmation before reference replacement.
+- DVC versioning of the promoted model **together with its metadata**.
+- Drift monitoring and labeled robustness stress tests.
+- Automated pytest coverage and existing GitHub Actions CI.
+
+### Limitations
+
+1. **No production serving or deployment.** The project is an educational MLOps implementation, not a live prediction service.
+2. **Limited model search.** The 54-candidate sweep is deliberately constrained; it is not exhaustive optimization.
+3. **Synthetic drift.** Stress scenarios are controlled perturbations, not representative evidence of production drift.
+4. **Local experiment history.** MLflow tracking data and isolated run artifacts are not automatically distributed with the Git repository.
+5. **Promotion replacement is not transactionally atomic across both files.** Exception rollback is implemented, but abrupt interruption requires manual verification.
+6. **No demonstrated production fairness or external validity.** Adult Income includes demographic attributes, historical biases, and substantial domain limitations. The model must not be used for consequential decisions without separate fairness, governance, privacy, and validity assessments.
+7. **End-to-end orchestration is pending.** Existing CI tests should not be conflated with a complete automated workflow.
+
+### Next phase: GitHub Actions orchestration
+
+The planned workflow will coordinate preprocessing, training, drift monitoring, robustness evaluation, and artifact handling with explicit dependencies and failure conditions. The intended separation remains:
+
+- **Automated:** reproducible stage execution, validation, reports, and CI checks.
+- **Manual/authorized:** approval of a new reference model, promotion, and persistence of its DVC pointer.
+
+This distinction keeps a successful experiment from silently replacing the model used by monitoring and robustness evaluation.
 
 ---
 
-## 6. Remaining MLOps Development
-
-The following components are planned or require additional verification.
-
-### 6.1 Model Inference Verification
-
-Verify that serialized model pipelines can accept raw feature records and reproduce predictions obtained from the corresponding transformed datasets.
-
-### 6.2 Automated Testing
-
-Extend the test suite to cover:
-
-- Saved dataset validation
-- Model-training functionality
-- Classification threshold selection
-- Model artifact loading
-- Inference consistency
-- Experiment reproducibility checks
-
-### 6.3 CI/CD with GitHub Actions
-
-Implement automated workflows to execute relevant tests and code-quality checks when repository changes are pushed or pull requests are opened.
-
-### 6.4 Data Drift Monitoring with Evidently
-
-Implement data drift detection using Evidently to compare reference and current datasets.
-
-The planned monitoring workflow will generate drift reports and apply configurable warning and failure thresholds.
-
-### 6.5 Pipeline Automation
-
-Evaluate integrating the preprocessing and training stages into a formal DVC pipeline with explicit dependencies and outputs.
-
----
-
-## 7. Project Scope and Limitations
-
-The project prioritizes MLOps engineering practices over exhaustive predictive modeling.
-
-Current limitations include:
-
-- A restricted model and hyperparameter search.
-- Validation-based threshold optimization without nested cross-validation.
-- Locally stored experiment tracking and generated model artifacts.
-- Pending end-to-end verification of saved inference pipelines.
-- CI/CD and drift monitoring not yet fully integrated.
-- No deployed model-serving endpoint.
-
-The Adult Income dataset is used as an educational benchmark. Its demographic attributes, historical context, and potential biases make it unsuitable for consequential real-world decisions without additional fairness, validity, and deployment assessments.
-
-The intended final deliverable is a reproducible machine learning workflow integrating version control, data preparation, model training, automated testing, experiment tracking, and monitoring.
+**Dataset attribution:** UCI Machine Learning Repository, Adult (Census Income) dataset. Refer to the [dataset record](https://archive.ics.uci.edu/dataset/2/adult) for source details and citation guidance.

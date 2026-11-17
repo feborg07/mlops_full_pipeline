@@ -1,5 +1,5 @@
 
-name:  MLOps CD Pipeline
+name:  MLOps Pipeline Orchestration
 
 on:
   workflow_dispatch:

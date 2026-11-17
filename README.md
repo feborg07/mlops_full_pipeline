@@ -2,7 +2,7 @@
 
 **Reproducible machine learning workflow for the UCI Adult Income classification dataset.** This educational project focuses on the *lifecycle* of a model—not merely fitting a classifier—including versioned data, reproducible preprocessing, experiment tracking, isolated training executions, explicit model promotion, drift detection, robustness evaluation, and automated tests.
 
-> **Project status (November 2026):** Core modeling, promotion, monitoring, robustness evaluation, DVC storage, and a GitHub Actions CI workflow are implemented. **GitHub Actions orchestration of the full multi-stage workflow is the next phase; it is not yet implemented.** There is no production prediction API or automatic deployment.
+> **Project status (November 2026):** Core modeling, promotion, monitoring, robustness evaluation, DVC storage, and a GitHub Actions CI workflow are implemented. **The multi-stage pipeline has passed both an earlier GitHub Actions quick-mode run and a local Windows quick-mode run using `scripts/run_pipeline.py`. The revised GitHub Actions workflow that invokes the shared Python orchestrator still requires a verification run.** There is no production prediction API or automatic deployment.
 
 ## Contents
 
@@ -16,7 +16,7 @@
 8. [DVC and artifact versioning](#8-dvc-and-artifact-versioning)
 9. [Data drift monitoring](#9-data-drift-monitoring)
 10. [Model robustness under drift](#10-model-robustness-under-drift)
-11. [Testing and existing CI](#11-testing-and-existing-ci)
+11. [Testing, CI, and pipeline orchestration](#11-testing-ci-and-pipeline-orchestration)
 12. [Reproducing the full workflow](#12-reproducing-the-full-workflow)
 13. [Command reference](#13-command-reference)
 14. [Scope, limitations, and next steps](#14-scope-limitations-and-next-steps)
@@ -58,7 +58,10 @@
 | Synthetic drift scenarios and Evidently monitoring | Implemented |
 | Robustness evaluation under drift | Implemented |
 | GitHub Actions **CI** workflow (`ci.yml`) | Implemented |
-| GitHub Actions **end-to-end workflow orchestration** | **Planned** |
+| GitHub Actions end-to-end orchestration (earlier stage-by-stage workflow) | Quick mode verified |
+| Shared local Python orchestration (`scripts/run_pipeline.py`) | Quick mode verified on Windows |
+| Updated GitHub Actions workflow calling the Python orchestrator | Configured; verification run pending |
+| Full-mode orchestration across environments | Not yet verified |
 | Production model-serving endpoint / automatic deployment | Out of scope |
 
 ## 2. Architecture and responsibilities
@@ -66,32 +69,31 @@
 The project separates **source control**, **artifact versioning**, **experiment tracking**, and **workflow execution**. These systems solve different problems and are not interchangeable.
 
 ```text
-Git / GitHub                  DVC + S3                    MLflow
-  source code, tests,          raw datasets,               candidate parameters,
-  configs, DVC pointers        reference model             metrics, run history
-         |                         |                          |
-         +-------------------------+--------------------------+
-                                   |
-                          Python entry points
-                                   |
-              raw Adult data --> preprocessing (3 variants)
-                                   |
-                      train / validation / test
-                                   |
-                        train.py + MLflow
-                                   |
-                   models/runs/<execution_id>/
-                         candidate + metadata
-                                   |
-                       promote.py (manual)
-                      validate / --confirm
-                                   |
-                      models/reference/  <--- DVC
-                                   |
-                    drift and robustness checks
+Git / GitHub                 DVC + public-read S3           MLflow
+  code, tests, workflows       raw data, reference model     local experiment tracking
+          |                              |                           |
+          +------------------------------+---------------------------+
+                                         |
+                          scripts/run_pipeline.py
+                              (shared orchestrator)
+                                         |
+                     optional DVC pull -> pytest tests
+                                         |
+                        preprocessing (three variants)
+                                         |
+                        quick or full candidate training
+                                         |
+                           synthetic drift generation
+                                         |
+                         Evidently drift monitoring
+                                         |
+                       reference model robustness checks
+                                         |
+                       generated reports / run artifacts
 
-Existing: GitHub Actions CI runs automated checks.
-Next: GitHub Actions coordinates multi-stage execution.
+Local: python -m scripts.run_pipeline --quick --pull-dvc
+GitHub Actions: orchestration_pipeline.yml -> run_pipeline.py
+Promotion: separate, explicit promote.py action; never automatic
 ```
 
 **Division of responsibility:**
@@ -100,12 +102,16 @@ Next: GitHub Actions coordinates multi-stage execution.
 - **DVC:** versions selected large/binary artifacts and retrieves their exact contents from S3. In this project, DVC is **not** the workflow orchestrator.
 - **MLflow:** records candidate experiments and associated metrics/artifacts. Local MLflow history is not automatically shared with GitHub clones.
 - **Python modules:** implement preprocessing, model training, drift detection, robustness evaluation, and promotion.
-- **GitHub Actions:** already runs CI checks; the planned extension will orchestrate stages without automatically promoting models.
+- **`scripts/run_pipeline.py`:** orchestrates tests, preprocessing, training, drift generation, monitoring, and robustness evaluation on any supported machine.
+- **GitHub Actions:** runs CI separately and provides a manually dispatched orchestration workflow that provisions an Ubuntu runner, restores DVC artifacts, invokes the Python orchestrator, and uploads results. It does not promote models.
 
 ### Main project paths
 
 ```text
-.github/workflows/ci.yml       Existing continuous-integration workflow
+.github/workflows/ci.yml       Continuous-integration workflow
+.github/workflows/orchestration_pipeline.yml  Manually dispatched pipeline workflow
+scripts/run_pipeline.py       Shared local / GitHub Actions orchestrator
+src/data/drift_generator.py   Synthetic drift scenario generator
 scripts/run_preprocessing.py   Preprocessing entry point
 src/data/preprocess.py         Loading, splitting, transformations
 src/data/monitoring.py         Evidently drift detection
@@ -125,7 +131,7 @@ reports/robustness/            Generated robustness reports (ignored by Git)
 mlflow.db                      Local MLflow SQLite tracking store
 ```
 
-Generated paths may not exist in a fresh clone until their corresponding stage runs. The exact tree can evolve as orchestration is added.
+Generated paths may not exist in a fresh clone until their corresponding stage runs.
 
 ## 3. Installation and reviewer quick start
 
@@ -183,10 +189,10 @@ The last command ensures that the DVC installation supports S3. Dependency avail
 ### 3.5 Retrieve DVC-managed artifacts
 
 ```bash
-dvc pull
+dvc pull data/raw.dvc models/reference.dvc
 ```
 
-This restores the DVC-tracked inputs and reference artifacts associated with the checked-out Git revision, including the raw Adult files and the promoted reference model, assuming the configured S3 objects remain available.
+Explicit targets are used because the earlier GitHub Actions run with a bare `dvc pull` restored raw data but did not restore `models/reference/`. The underlying reason for that behavior has not yet been established. The command retrieves the raw Adult files and the promoted reference model for the checked-out Git revision, provided the S3 objects remain available.
 
 Expected raw inputs include:
 
@@ -440,7 +446,7 @@ git push
 
 ```bash
 git checkout <COMMIT_OR_TAG>
-dvc pull
+dvc pull data/raw.dvc models/reference.dvc
 dvc status
 ```
 
@@ -468,7 +474,7 @@ The configured S3 remote supports anonymous **reads** of designated objects. Upl
 | Local MLflow SQLite database/artifacts | Local; not automatically shared |
 | Drift and robustness reports | Generated locally; not automatically versioned |
 
-**DVC does not currently orchestrate the stages.** GitHub Actions is the chosen orchestrator for the next development phase. There is no requirement to introduce `dvc.yaml` solely to use DVC for artifact versioning.
+**DVC does not orchestrate the stages.** The Python script `scripts/run_pipeline.py` defines stage order, and GitHub Actions provides remote execution infrastructure. There is no requirement to introduce `dvc.yaml` solely to use DVC for artifact versioning.
 
 ## 9. Data drift monitoring
 
@@ -548,7 +554,7 @@ The example uses Bash line continuation (`\`). On PowerShell, use a single line 
 
 These values are from a recorded run; results depend on the reference model and the generated drift datasets. The severe scenario showed substantial F1 degradation, consistent with the monitoring alert. Reports are written under `reports/robustness/` and are not currently committed to Git.
 
-## 11. Testing and existing CI
+## 11. Testing, CI, and pipeline orchestration
 
 ### 11.1 Run tests locally
 
@@ -574,82 +580,101 @@ The latest reported full run was:
 
 The warnings were deprecation notices from third-party dependencies (Evidently/NumPy, Litestar, and MLflow/SQLAlchemy). Passing tests do not prove absence of all data leakage, fairness issues, or deployment failures.
 
-### 11.2 GitHub Actions: implemented versus planned
+### 11.2 Continuous integration (CI)
 
-The repository already contains `.github/workflows/ci.yml` for CI testing. A separate `retrain.yml` was intentionally removed. **Do not interpret the presence of CI as proof that full preprocessing, training, drift monitoring, robustness evaluation, or model promotion are currently orchestrated in GitHub Actions.**
+`.github/workflows/ci.yml` handles automated code checks. A separate `retrain.yml` was intentionally removed. CI is distinct from end-to-end pipeline execution: it does not imply model deployment.
 
-The next phase will define an orchestrated workflow with explicit stage ordering, artifact handling, failure behavior, and permissions. Model promotion should remain an **explicitly authorized** action rather than an automatic consequence of a passing training job.
+### 11.3 Shared pipeline orchestration
+
+`scripts/run_pipeline.py` is the single source of truth for execution order. It runs these stages sequentially:
+
+1. Optional explicit DVC pull (`--pull-dvc`).
+2. `python -m pytest tests/ -q`.
+3. `python -m scripts.run_preprocessing`.
+4. `python -m src.models.train --quick` or `python -m src.models.train`.
+5. `python -m src.data.drift_generator`.
+6. `python -m src.data.monitoring`.
+7. `python -m src.models.robustness`.
+
+An unexpected stage failure stops execution. Monitoring exit code `1` is treated as an expected critical-drift alert for the deliberately severe synthetic scenario; other unexpected failures are not ignored. No stage promotes the reference model.
+
+### 11.4 GitHub Actions orchestration
+
+The manually dispatched `.github/workflows/orchestration_pipeline.yml` exposes a `training_mode` choice (`quick` or `full`). Its infrastructure responsibilities are repository checkout, Python 3.11 and dependency setup, explicit DVC restoration, reference artifact verification, and artifact upload. It invokes the shared orchestrator without `--pull-dvc` because the workflow has already restored DVC artifacts:
+
+```bash
+python -m scripts.run_pipeline --quick
+# or
+python -m scripts.run_pipeline --full
+```
+
+The workflow uploads `reports/drift/`, `reports/robustness/`, `data/drift/drift_metadata.json`, and `models/runs/` as GitHub Actions artifacts (14-day retention). The GitHub Actions run summary records training mode, job result, reference-promotion policy, and commit. Drift details are available in logs and reports rather than a dedicated workflow summary field.
+
+**Verification status:** An earlier GitHub Actions quick-mode workflow completed successfully. The shared Python orchestrator separately completed locally on Windows 11 in quick mode with DVC pull. The *revised* GitHub Actions YAML that calls `run_pipeline.py` has not yet been verified by a reported successful run. Full-mode orchestration is also not yet verified.
 
 ## 12. Reproducing the full workflow
 
-The following is a **manual, ordered reproduction guide**. It is not yet a single GitHub Actions pipeline.
+### 12.1 One-command local orchestration
 
-**A. Set up and retrieve versioned artifacts**
+After cloning the repository, activating Python 3.11, and installing dependencies as described in Section 3, run from the project root:
 
 ```bash
-python -m pip install -r requirements.txt
-python -m pip install "dvc[s3]"
-dvc pull
+# Complete quick-mode workflow, including DVC retrieval
+python -m scripts.run_pipeline --quick --pull-dvc
+
+# Full candidate search, including DVC retrieval
+python -m scripts.run_pipeline --full --pull-dvc
+
+# Skip DVC retrieval when required artifacts already exist locally
+python -m scripts.run_pipeline --quick
 ```
 
-**B. Validate the repository**
+`--quick` is the default training mode; `--full` runs the larger candidate search. `--pull-dvc` restores both the raw dataset and reference model. The orchestrator verifies that the reference model and metadata are present, executes tests and all ML stages, then prints a summary. A critical synthetic drift alert is expected and does not automatically fail the overall pipeline.
+
+**Recorded local quick-mode result (Windows 11, November 17, 2026):** all seven stages completed; 451 tests passed with 11 dependency warnings; 12 training candidates were evaluated; the severe drift scenario produced a CRITICAL alert; robustness evaluation completed; reference promotion remained disabled. Total recorded stage duration was approximately 229 seconds.
+
+### 12.2 GitHub Actions execution
+
+In the repository's **Actions** tab, select **MLOps Pipeline Orchestration**, choose **Run workflow**, select `quick` or `full`, and start the run. The workflow uses an Ubuntu 24.04 runner, explicitly restores DVC artifacts, and invokes the same Python orchestrator used locally. Download generated reports from the run's uploaded artifacts.
+
+The revised workflow still requires a successful GitHub Actions verification run after it is committed. The earlier successful GitHub Actions run used separate workflow steps rather than the shared Python entry point.
+
+### 12.3 Optional candidate review and promotion
+
+Full training generates an isolated candidate under `models/runs/<execution_id>/`. Promotion is deliberately **not** part of orchestration. After reviewing the results, validate the candidate:
 
 ```bash
-python -m pytest tests/ -q
+python -m src.models.promote --run-id <FULL_EXECUTION_ID>
 ```
 
-**C. Regenerate preprocessing outputs**
+If promotion is explicitly approved:
 
 ```bash
-python -m scripts.run_preprocessing
-```
-
-**D. Smoke-test training, then run the full sweep if desired**
-
-```bash
-python -m src.models.train --quick
-python -m src.models.train
-```
-
-Record the new `execution_id` printed by the full run. Review its summary, metrics, and metadata. To validate without changing the reference:
-
-```bash
-python -m src.models.promote --run-id <NEW_FULL_EXECUTION_ID>
-```
-
-**E. Evaluate drift and robustness**
-
-Generate the control/mild/moderate/severe drift datasets using the project's drift-generation entry point, then run:
-
-```bash
-python -m src.data.monitoring
-```
-
-Use the full robustness command in [Section 10](#10-model-robustness-under-drift). The reference model downloaded with `dvc pull` can be used for these checks; a newly trained candidate is **not** used until explicitly promoted.
-
-**F. Optional: promote a new candidate**
-
-```bash
-python -m src.models.promote --run-id <NEW_FULL_EXECUTION_ID> --confirm
+python -m src.models.promote --run-id <FULL_EXECUTION_ID> --confirm
 dvc add models/reference
 dvc push
 ```
 
-Promotion and pushing to the shared remote are **maintainer operations**, not required for a reviewer who only wants to reproduce experiments. Do not promote a new candidate merely to verify that training works.
+Writing to the shared S3 DVC remote requires authorized AWS write access. Reviewers can reproduce training and evaluate local candidates without those credentials. The Git-tracked `models/reference.dvc` pointer must also be committed and pushed when publishing a new reference version (see Section 7).
 
 ### Reproducibility boundaries
 
-- Fixed seeds and DVC pointers help reproduce inputs and processing, but do not guarantee bit-for-bit identical models across every platform/library version.
-- MLflow run IDs and training execution IDs are generated anew for each run.
-- Full training can be more expensive than quick mode.
-- The local MLflow database and generated reports are not part of the versioned reference artifact by default.
-- The reference model represents an explicitly promoted snapshot, not automatically the most recently trained candidate.
+- Fixed seeds and DVC pointers help reproduce inputs and processing but do not guarantee bit-for-bit identical models across platforms or library versions.
+- MLflow run IDs and training execution IDs are generated anew on each run.
+- Full training can be substantially more expensive than quick mode.
+- Local MLflow history is not automatically shared by cloning the repository.
+- The reference model is an explicitly promoted snapshot, not automatically the most recently trained candidate.
+- The orchestrator is a sequential local/CI runner, not a production deployment or distributed scheduling service.
 
 ## 13. Command reference
 
 | Task | Command |
 |---|---|
-| Download DVC-managed data and model | `dvc pull` |
+| Download DVC-managed data and model | `dvc pull data/raw.dvc models/reference.dvc` |
+| Run local orchestrator (quick, with DVC) | `python -m scripts.run_pipeline --quick --pull-dvc` |
+| Run local orchestrator (full, with DVC) | `python -m scripts.run_pipeline --full --pull-dvc` |
+| Run local orchestrator (existing DVC artifacts) | `python -m scripts.run_pipeline --quick` |
+| Generate drift scenarios | `python -m src.data.drift_generator` |
 | Check DVC status | `dvc status` |
 | Run all tests | `python -m pytest tests/ -q` |
 | Run preprocessing | `python -m scripts.run_preprocessing` |
@@ -675,6 +700,8 @@ Promotion and pushing to the shared remote are **maintainer operations**, not re
 - DVC versioning of the promoted model **together with its metadata**.
 - Drift monitoring and labeled robustness stress tests.
 - Automated pytest coverage and existing GitHub Actions CI.
+- Shared Python pipeline orchestration, verified locally in quick mode.
+- An earlier GitHub Actions end-to-end quick-mode run, with a revised shared-script workflow awaiting verification.
 
 ### Limitations
 
@@ -684,16 +711,19 @@ Promotion and pushing to the shared remote are **maintainer operations**, not re
 4. **Local experiment history.** MLflow tracking data and isolated run artifacts are not automatically distributed with the Git repository.
 5. **Promotion replacement is not transactionally atomic across both files.** Exception rollback is implemented, but abrupt interruption requires manual verification.
 6. **No demonstrated production fairness or external validity.** Adult Income includes demographic attributes, historical biases, and substantial domain limitations. The model must not be used for consequential decisions without separate fairness, governance, privacy, and validity assessments.
-7. **End-to-end orchestration is pending.** Existing CI tests should not be conflated with a complete automated workflow.
+7. **Revised GitHub Actions integration not yet reverified.** The earlier stage-by-stage GitHub Actions quick-mode workflow passed, but the updated YAML invoking the shared Python orchestrator still requires a new run.
+8. **Full-mode orchestration not yet verified.** Quick-mode successes do not demonstrate the entire 54-candidate execution in both environments.
+9. **Explicit DVC targets are currently required in the tested GitHub workflow.** The cause of the bare `dvc pull` omission of the reference model has not been conclusively identified.
 
-### Next phase: GitHub Actions orchestration
+### Remaining verification and maintenance
 
-The planned workflow will coordinate preprocessing, training, drift monitoring, robustness evaluation, and artifact handling with explicit dependencies and failure conditions. The intended separation remains:
+- Run the revised `orchestration_pipeline.yml` in GitHub Actions to confirm it successfully calls `scripts/run_pipeline.py`.
+- Optionally validate full-mode orchestration on an appropriately provisioned runner or local machine.
+- Investigate why an earlier untargeted `dvc pull` did not restore the reference directory, while explicit targets did.
+- Review action version deprecation notices and update individual GitHub Actions dependencies only when compatible.
+- Preserve the boundary between **automated** testing, training, drift analysis, and reporting and **manual/authorized** reference promotion and DVC publishing.
 
-- **Automated:** reproducible stage execution, validation, reports, and CI checks.
-- **Manual/authorized:** approval of a new reference model, promotion, and persistence of its DVC pointer.
-
-This distinction keeps a successful experiment from silently replacing the model used by monitoring and robustness evaluation.
+No production model-serving API or automatic model deployment is included in this project.
 
 ---
 

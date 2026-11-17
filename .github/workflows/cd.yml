@@ -64,7 +64,7 @@ jobs:
           test -f models/reference/best_model_metadata.json
 
           echo "Reference model and metadata restored successfully."
-          
+
       # 5. Run existing automated tests.
       - name: Run tests
         run: python -m pytest tests/ -q
@@ -111,6 +111,20 @@ jobs:
       # 10. Evaluate the unchanged reference model.
       - name: Evaluate model robustness
         run: python -m src.models.robustness
+      
+      #10.5 Verify reference artifacts survived all preceding stages.
+      - name: Verify reference model before robustness
+        run: |
+          echo "=== Reference directory ==="
+          ls -lah models/reference/
+
+          echo "=== Reference model ==="
+          test -f models/reference/best_model_pipeline.joblib
+
+          echo "=== Reference metadata ==="
+          test -f models/reference/best_model_metadata.json
+
+          echo "Reference artifacts verified."
 
       # 11. Generate a GitHub Actions run summary.
       - name: Write run summary

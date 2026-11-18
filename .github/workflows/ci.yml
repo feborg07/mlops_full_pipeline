@@ -12,30 +12,148 @@ permissions:
   contents: read
 
 jobs:
+  # ============================================================
+  # JOB 1 — AUTOMATED TESTING
+  # ============================================================
   test:
     name: Python Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
-      # Retrieve the repository source code.
+      # 1. Retrieve repository source code.
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Match the project's Python version.
+      # 2. Configure Python.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
 
-      # Install project dependencies.
+      # 3. Install project dependencies.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      # Run all unit and integration tests,
-      # including model artifact validation tests.
+      # 4. Execute complete test suite.
       - name: Run unit and integration tests
         run: |
           python -m pytest tests/ -v
+
+  # ============================================================
+  # JOB 2 — TRAINING AND PERFORMANCE VALIDATION
+  # ============================================================
+  train:
+    name: Train and Validate Model
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      MIN_VALIDATION_F1: "0.65"
+
+    steps:
+      # 1. Retrieve repository source code.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Configure Python.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # 3. Install project dependencies and DVC S3 support.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "dvc[s3]==3.67.1"
+
+      # 4. Restore version-controlled training data.
+      - name: Pull DVC training data
+        run: |
+          dvc pull data/raw.dvc --verbose
+
+      # 5. Generate preprocessing variants and data splits.
+      - name: Run preprocessing
+        run: |
+          python -m scripts.run_preprocessing
+
+      # 6. Train candidates using the quick configuration.
+      # This does not promote or replace the reference model.
+      - name: Train candidate models
+        run: |
+          python -m src.models.train --quick
+
+      # 7. Verify model performance from MLflow metrics.
+      # Exit with status 1 if no valid candidate reaches
+      # the required validation F1 score.
+      - name: Validate minimum model performance
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          import mlflow
+          import pandas as pd
+
+          threshold = float(os.environ["MIN_VALIDATION_F1"])
+
+          runs = mlflow.search_runs(
+              search_all_experiments=True,
+              output_format="pandas",
+          )
+
+          metric_column = "metrics.val_f1"
+
+          if runs.empty or metric_column not in runs.columns:
+              print("ERROR: No MLflow validation F1 metrics found.")
+              sys.exit(1)
+
+          scores = pd.to_numeric(
+              runs[metric_column],
+              errors="coerce",
+          ).dropna()
+
+          if scores.empty:
+              print("ERROR: No valid validation F1 scores found.")
+              sys.exit(1)
+
+          best_f1 = float(scores.max())
+
+          print(f"Best validation F1: {best_f1:.4f}")
+          print(f"Minimum required F1: {threshold:.4f}")
+
+          if best_f1 < threshold:
+              print("FAILED: Model performance below threshold.")
+              sys.exit(1)
+
+          print("PASSED: Model meets minimum performance threshold.")
+          PY
+
+      # 8. Publish execution summary.
+      - name: Write training summary
+        if: always()
+        run: |
+          echo "## Sprint 17 — CI Training" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Training mode: quick" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Minimum validation F1: $MIN_VALIDATION_F1" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Training job status: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Reference model promotion: disabled" >> "$GITHUB_STEP_SUMMARY"
+
+      # 9. Preserve training artifacts for inspection.
+      - name: Upload training artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-training-${{ github.run_id }}
+          path: |
+            models/runs/
+          if-no-files-found: warn
+          retention-days: 14

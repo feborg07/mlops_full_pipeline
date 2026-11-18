@@ -2,7 +2,7 @@
 
 **Reproducible machine learning workflow for the UCI Adult Income classification dataset.** This educational project focuses on the *lifecycle* of a model—not merely fitting a classifier—including versioned data, reproducible preprocessing, experiment tracking, isolated training executions, explicit model promotion, drift detection, robustness evaluation, and automated tests.
 
-> **Project status (November 2026):** Core modeling, explicit promotion, DVC/S3 storage, monitoring, robustness evaluation, automated tests, and GitHub Actions orchestration are implemented. The shared Python orchestrator has passed a local Windows quick-mode run and **both quick-mode and full-mode GitHub Actions runs**. The full remote execution completed **54/54 training candidates**. There is no production prediction API or automatic deployment.
+> **Project status (November 18, 2026):** Data preparation, YAML-configurable training, MLflow tracking, explicit promotion, DVC/S3 artifact storage, drift monitoring, robustness evaluation, tests, and GitHub Actions orchestration are implemented. The latest **local YAML-driven full training run** evaluated the default 54 candidates, and the updated test suite passed **454 tests (11 third-party warnings)**. An earlier revision completed both quick- and full-mode GitHub Actions orchestration, with **54/54 candidates successful** in its full run. The YAML-refactored revision has not yet been independently confirmed by a new GitHub Actions run. There is no production prediction API or automatic deployment.
 
 ## Contents
 - [Technical Report](#technical-report)
@@ -29,24 +29,26 @@ drift monitoring, robustness evaluation, and conclusions are documented in:
 
 [Read the Final Technical Report (PDF)](reports/Sprint_17_Final_Technical_Report.pdf)
 
+**Documentation version note:** The technical PDF was prepared before the YAML-driven training refactor. This README documents the newer `configs/config.yml` interface and the November 18, 2026 verification result (454 passed). Synchronize the PDF with these changes before final submission if the report must reflect the latest implementation.
+
 
 ## Quick Start — Run the Complete Pipeline
 
 After cloning the repository and installing the dependencies ([installation instructions](#3-installation-and-reviewer-quick-start)), execute the complete MLOps workflow from the repository root:
 
-**Quick mode — 12 model candidates (recommended for verification):**
+**Quick mode — 12 model candidates under the current default YAML (recommended for verification):**
 
 ```bash
 python -m scripts.run_pipeline --quick --pull-dvc
 ```
 
-**Full mode — 54 model candidates:**
+**Full mode — 54 model candidates under the current default YAML:**
 
 ```bash
 python -m scripts.run_pipeline --full --pull-dvc
 ```
 
-Both commands execute automated tests, preprocessing, model training with MLflow tracking, synthetic drift generation, Evidently monitoring, and robustness evaluation. The `--pull-dvc` option retrieves the required DVC-managed datasets and reference model.
+Both commands execute automated tests, preprocessing, model training with MLflow tracking, synthetic drift generation, Evidently monitoring, and robustness evaluation. Training reads **`configs/config.yml`** by default; changing its hyperparameter grids can change the candidate counts. The `--pull-dvc` option retrieves the required DVC-managed datasets and reference model.
 
 **Important:** Model promotion is intentionally excluded from automated orchestration and requires explicit authorization.
 
@@ -64,16 +66,19 @@ For detailed execution instructions, GitHub Actions orchestration, and model pro
 | Approximate class distribution | 76.1% `<=50K`; 23.9% `>50K` |
 | Seed | 42 |
 | Python | 3.11 (developed with 3.11.4) |
-| Primary selection metric | Validation F1 for the positive class |
+| Primary selection metric | Validation F1 for the positive class (`selection_metric: val_f1`) |
+| Training configuration | [`configs/config.yml`](configs/config.yml) — YAML-defined algorithms, grids, seed, paths, and MLflow experiment |
+| Search method | Cartesian-product hyperparameter enumeration (not `GridSearchCV` or Optuna) |
 | Selected preprocessing variant | `baseline` |
 | Selected model family | `HistGradientBoostingClassifier` |
 | Selected validation F1 | 0.7337 |
 | Selected held-out test F1 | 0.7150 |
-| Latest local test run | **451 passed, 11 warnings** (November 2026) |
-| Remote orchestration | **Quick and full GitHub Actions runs successful** |
-| Verified full-run candidates | **54 / 54 successful** |
+| Latest local test run | **454 passed, 11 third-party warnings** (November 18, 2026) |
+| Remote orchestration | **Quick and full GitHub Actions runs successful on an earlier revision**; updated YAML revision pending remote verification |
+| Verified full-run candidates | **54 / 54 successful** in the earlier inspected GitHub Actions run |
+| Latest local YAML-driven full run | Default 54-candidate sweep completed; `baseline` preferred by validation (November 18, 2026) |
 
-**Core tools:** Python, pandas, NumPy, scikit-learn, pytest, Git/GitHub, DVC with an Amazon S3 remote, MLflow (SQLite tracking), joblib, Evidently, and GitHub Actions.
+**Core tools:** Python, pandas, NumPy, scikit-learn, PyYAML, pytest, Git/GitHub, DVC with an Amazon S3 remote, MLflow (SQLite tracking), joblib, Evidently, and GitHub Actions.
 
 ### Implementation status
 
@@ -82,6 +87,8 @@ For detailed execution instructions, GitHub Actions orchestration, and model pro
 | Git source control and DVC-backed raw data | Implemented |
 | Public-read S3 downloads for DVC artifacts | Implemented |
 | EDA and preprocessing variants | Implemented |
+| External YAML training configuration and grid enumeration | Implemented; validated locally |
+| YAML-aware training unit tests | Implemented; 454-test suite passing |
 | Automated preprocessing, training, monitoring, and robustness tests | Implemented |
 | MLflow experiment tracking and candidate isolation | Implemented |
 | Explicit, validated model promotion | Implemented |
@@ -90,79 +97,87 @@ For detailed execution instructions, GitHub Actions orchestration, and model pro
 | Robustness evaluation under drift | Implemented |
 | GitHub Actions **CI** workflow (`ci.yml`) | Implemented |
 | Shared local Python orchestration (`scripts/run_pipeline.py`) | Quick mode verified on Windows |
-| GitHub Actions workflow invoking the shared orchestrator | Quick and full modes verified on Ubuntu |
-| Full-mode candidate sweep | 54/54 candidates successful in GitHub Actions |
+| GitHub Actions workflow invoking the shared orchestrator | Quick and full modes verified on Ubuntu **before the YAML training refactor** |
+| Full-mode candidate sweep | 54/54 successful in earlier GitHub Actions run; latest local YAML sweep completed with default 54-candidate grid |
 | GitHub Actions evaluation artifacts | Training, drift, and robustness reports inspected |
 | Production model-serving endpoint / automatic deployment | Out of scope |
 
 ## 2. Architecture and responsibilities
 
-The project separates **source control**, **artifact versioning**, **experiment tracking**, and **workflow execution**. These systems solve different problems and are not interchangeable.
+The project separates **source control**, **artifact versioning**, **training configuration**, **experiment tracking**, and **workflow execution**. These systems solve different problems and are not interchangeable.
 
 ```text
-Git / GitHub                 DVC + public-read S3           MLflow
-  code, tests, workflows       raw data, reference model     local experiment tracking
-          |                              |                           |
-          +------------------------------+---------------------------+
+Git / GitHub                  DVC + public-read S3            MLflow (SQLite)
+  code, tests, YAML            raw data, reference model      metrics + model artifacts
+          |                              |                             ^
+          +------------------------------+-----------------------------|
                                          |
-                          scripts/run_pipeline.py
-                              (shared orchestrator)
+                      scripts/run_pipeline.py
+                          (shared orchestrator)
                                          |
-                     optional DVC pull -> pytest tests
+                        optional DVC pull -> pytest
                                          |
-                        preprocessing (three variants)
+                  preprocessing (three variants)
+                 PreprocessingConfig in Python
                                          |
-                        quick or full candidate training
+         configs/config.yml ----> src/models/train.py ------> MLflow
+            seed, variants,          quick / full sweep
+            algorithm grids,         + validation selection
+            local paths
                                          |
-                           synthetic drift generation
+                        synthetic drift generation
                                          |
-                         Evidently drift monitoring
+                          Evidently monitoring
                                          |
-                       reference model robustness checks
+                     reference model robustness checks
                                          |
-                       generated reports / run artifacts
+                        generated reports and runs
 
 Local: python -m scripts.run_pipeline --quick --pull-dvc
-GitHub Actions: orchestration workflow -> run_pipeline.py
+GitHub Actions: ml_pipeline_orchestration.yml -> run_pipeline.py
 Promotion: separate, explicit promote.py action; never automatic
 ```
 
 **Division of responsibility:**
 
-- **Git:** versions code, documentation, tests, configuration, and `.dvc` pointer files.
+- **Git:** versions code, documentation, `configs/config.yml`, tests, workflow definitions, and `.dvc` pointer files.
 - **DVC:** versions selected large/binary artifacts and retrieves their exact contents from S3. In this project, DVC is **not** the workflow orchestrator.
-- **MLflow:** records candidate experiments and associated metrics/artifacts. Local MLflow history is not automatically shared with GitHub clones.
+- **`configs/config.yml` (PyYAML):** is the default **model-training** configuration. It defines the four model families' fixed parameters and Cartesian-product grids, the selected preprocessing variants, seed, supported selection metric, training output paths, and MLflow experiment settings. It is not a replacement for preprocessing configuration.
+- **`PreprocessingConfig`:** remains in `src/data/preprocess.py`; it configures data cleaning, engineering, and partitioning independently of training YAML.
+- **MLflow:** records candidate experiments, hyperparameters, validation metrics, model artifacts, and training-configuration fingerprints. Local MLflow history is not automatically shared with GitHub clones.
 - **Python modules:** implement preprocessing, model training, drift detection, robustness evaluation, and promotion.
-- **`scripts/run_pipeline.py`:** orchestrates tests, preprocessing, training, drift generation, monitoring, and robustness evaluation on any supported machine.
-- **GitHub Actions:** runs CI separately and provides a manually dispatched orchestration workflow that provisions an Ubuntu runner, restores DVC artifacts, invokes the Python orchestrator, and uploads results. It does not promote models.
+- **`scripts/run_pipeline.py`:** orchestrates tests, preprocessing, training, drift generation, monitoring, and robustness evaluation. Its training subprocess uses the default `configs/config.yml` unless that file is changed; the orchestrator currently does not expose a separate `--config` forwarding option.
+- **GitHub Actions:** runs CI separately and provides a manually dispatched orchestration workflow that provisions an Ubuntu runner, restores DVC artifacts, invokes the shared Python orchestrator, and uploads results. It does not promote models.
 
 ### Main project paths
 
 ```text
-.github/workflows/ci.yml       Continuous-integration workflow
-.github/workflows/orchestration_pipeline.yml  Manually dispatched pipeline workflow
-scripts/run_pipeline.py       Shared local / GitHub Actions orchestrator
-src/data/drift_generator.py   Synthetic drift scenario generator
-scripts/run_preprocessing.py   Preprocessing entry point
-src/data/preprocess.py         Loading, splitting, transformations
-src/data/monitoring.py         Evidently drift detection
-src/models/train.py            Model sweep and MLflow logging
-src/models/promote.py          Explicit candidate validation/promotion
-src/models/robustness.py       Evaluation under synthetic drift
-tests/                         pytest test suite
-data/raw/                      DVC-retrieved Adult data
-data/processed/<variant>/      Generated training/validation/test partitions
-data/drift/<scenario>/         Generated control/mild/moderate/severe datasets
-models/preprocessors/          Fitted preprocessing artifacts
-models/runs/<execution_id>/    Isolated experiment output
-models/reference/              DVC-tracked promoted model and metadata
-models/reference.dvc           Git-tracked pointer for reference directory
-reports/drift/                 Generated drift reports
-reports/robustness/            Generated robustness reports (ignored by Git)
-mlflow.db                      Local MLflow SQLite tracking store
+.github/workflows/ci.yml                    Continuous integration
+.github/workflows/ml_pipeline_orchestration.yml  Manual pipeline execution
+configs/config.yml                          Version-controlled training settings
+scripts/run_pipeline.py                     Local / GitHub Actions orchestrator
+scripts/run_preprocessing.py                Preprocessing entry point
+src/data/preprocess.py                      Loading, splitting, transformations
+src/data/drift_generator.py                Synthetic drift scenario generator
+src/data/monitoring.py                     Evidently drift detection
+src/models/train.py                        YAML-driven model sweep, validation, MLflow
+src/models/promote.py                      Explicit candidate validation/promotion
+src/models/robustness.py                   Evaluation under synthetic drift
+tests/                                     pytest test suite
+data/raw/                                  DVC-retrieved Adult data
+data/processed/<variant>/                 Generated train/validation/test partitions
+data/drift/<scenario>/                    Generated control/mild/moderate/severe data
+models/preprocessors/                     Fitted preprocessing artifacts
+models/runs/<execution_id>/               Isolated candidate experiment outputs
+models/reference/                         DVC-tracked promoted model and metadata
+models/reference.dvc                      Git-tracked pointer for reference directory
+reports/drift/                            Generated Evidently reports
+reports/robustness/                       Generated robustness reports
+mlflow.db                                 Local MLflow SQLite tracking store
+mlartifacts/                              Local MLflow artifacts
 ```
 
-Generated paths may not exist in a fresh clone until their corresponding stage runs.
+Generated paths may not exist in a fresh clone until their corresponding stage runs. The YAML settings are committed to Git; they are not a DVC data artifact.
 
 ## 3. Installation and reviewer quick start
 
@@ -213,7 +228,7 @@ python -m pip install -r requirements.txt
 python -m pip install "dvc[s3]"
 ```
 
-The last command ensures that the DVC installation supports S3. Dependency availability and exact behavior may differ across platforms.
+The last command ensures that the DVC installation supports S3. **PyYAML is required** because training reads `configs/config.yml`. The current MLflow model-logging code also reads installed versions of `scikit-learn`, `numpy`, `scipy`, `pandas`, `cloudpickle`, and `skops` to build explicit model dependency metadata. Ensure these packages are available on a clean installation and declared in `requirements.txt`; do not assume that packages installed only in the developer’s environment will be present in GitHub Actions. Dependency availability and exact behavior may differ across platforms.
 
 ### 3.5 Retrieve DVC-managed artifacts
 
@@ -244,7 +259,7 @@ python -m pytest tests/ -q
 dvc status
 ```
 
-The last recorded complete local run passed **451 tests with 11 third-party deprecation warnings**. This is a historical result, not a guarantee of the same count or runtime on another checkout.
+The latest reported complete local run of the YAML-refactored code passed **454 tests with 11 third-party deprecation warnings** on November 18, 2026. This is an observed result, not a guarantee of identical behavior on another checkout or environment.
 
 > **Security:** `joblib`/pickle model files can execute code when loaded. Only load model artifacts from a trusted repository and storage source. Public readability does not imply that arbitrary external artifacts are safe.
 
@@ -558,7 +573,7 @@ Preprocessing behavior is controlled through the `PreprocessingConfig` dataclass
 
 Configuration options include imputation strategies, numerical scaling, rare-category handling, financial transformations, education representation, interaction features, duplicate-aware splitting, partition proportions, and random seed.
 
-The standard configuration uses `random_state=42`.
+The standard preprocessing configuration uses `random_state=42`. **This Python dataclass is distinct from `configs/config.yml`, which controls the downstream model-training search.** Editing the YAML training seed or model grid does not change the already saved preprocessing partitions; rerun preprocessing if its configuration or input data changes.
 
 ### 5.2 Data Loading, Cleaning, and Validation
 
@@ -859,7 +874,7 @@ The training module does not reload the raw dataset, recreate data partitions, o
 The workflow follows these stages:
 
 1. **Load and validate inputs:** Read the saved feature matrices, target labels, and fitted preprocessor for each variant.
-2. **Generate model candidates:** Construct predefined algorithm and hyperparameter combinations.
+2. **Load training settings and generate candidates:** Validate `configs/config.yml` (or a CLI-supplied YAML path), then enumerate the Cartesian product of each model family’s grid.
 3. **Fit candidates:** Train each candidate using its training partition.
 4. **Generate validation probabilities:** Estimate positive-class probabilities on validation observations.
 5. **Optimize decision thresholds:** Find the threshold maximizing validation F1 for each candidate.
@@ -867,59 +882,89 @@ The workflow follows these stages:
 7. **Evaluate variant winners:** In full mode, evaluate each variant winner using its held-out test partition.
 8. **Select the preferred candidate:** Compare variant winners using validation results, not test performance.
 9. **Save artifacts:** Serialize the selected fitted pipeline, metadata, experiment summaries, and leaderboards.
-10. **Track experiments:** Record candidate parameters, metrics, and related artifacts in MLflow.
+10. **Track experiments:** Record candidate parameters, metrics, configuration SHA-256, and related artifacts in MLflow.
 
 Training and promotion are deliberately separate operations. A successful training execution does not automatically replace the reference model.
 
-### 6.2 Model Families and Hyperparameter Search
+### 6.2 Model Families, YAML Configuration, and Hyperparameter Search
 
-Four classification algorithms were selected to provide methodological diversity:
+**Source of truth:** [`configs/config.yml`](configs/config.yml). Earlier versions of this project hard-coded model grids in `src/models/train.py`; the current implementation loads and validates them using **PyYAML**. The training module retains Python implementations of candidate construction, validation-F1 ranking, threshold selection, MLflow tracking, and artifact serialization.
+
+The YAML contains these top-level sections:
+
+| YAML key | Purpose |
+|---|---|
+| `seed` | Random seed passed to model constructors as `random_state` (default `42`) |
+| `variants` | Which saved preprocessing variants to train (`baseline`, `robust`, `interactions`) |
+| `selection_metric` | Declares selection by validation F1; currently only `val_f1` is accepted |
+| `paths` | Default processed-data, preprocessor, run-output, MLflow database, and artifact paths |
+| `mlflow.experiment` | Default MLflow experiment name (`adult-income-saved-splits`) |
+| `models.<family>.fixed` | Estimator constructor settings held constant within that family's sweep |
+| `models.<family>.grid` | Lists of parameter values combined through a Cartesian product in full mode |
+
+An excerpt of the actual configuration illustrates the distinction between fixed values and search values:
+
+```yaml
+seed: 42
+variants: [baseline, robust, interactions]
+selection_metric: val_f1
+
+models:
+  hist_gradient_boosting:
+    fixed:
+      max_iter: 150
+    grid:
+      learning_rate: [0.05, 0.1]
+      max_leaf_nodes: [15, 31]
+```
+
+This is an **excerpt**, not a standalone replacement for `config.yml`. The actual file includes the required `paths`, `mlflow`, and all four model families. Its loader currently requires **exactly** `logistic_regression`, `random_forest`, `hist_gradient_boosting`, and `extra_trees`, with nonempty grids and no overlap between fixed and swept parameters. Unsupported variants or a selection metric other than `val_f1` are rejected. The training config is therefore editable but **not an arbitrary plug-in algorithm framework**.
+
+#### Why these model families?
 
 | Algorithm | Main characteristics | Role in experiment |
 |---|---|---|
 | Logistic Regression | Linear, interpretable probabilistic classifier | Establishes a simpler baseline |
 | Random Forest | Ensemble of independently constructed decision trees | Captures nonlinear relationships and interactions |
-| HistGradientBoosting | Sequentially constructed boosted trees using histogram-based splits | Evaluates gradient boosting on structured tabular data |
+| HistGradientBoosting | Sequentially constructed boosted trees using histogram-based splits | Evaluates gradient boosting on tabular data |
 | Extra Trees | Ensemble of highly randomized decision trees | Tests whether additional tree randomization improves generalization |
 
-The experiment uses a predefined Cartesian-product hyperparameter grid implemented directly in Python.
+#### Default YAML search space
 
-#### Hyperparameter configurations
-
-| Algorithm | Hyperparameters explored | Combinations per variant |
+| Algorithm | `grid` values | Configurations per variant |
 |---|---|---:|
-| Logistic Regression | `C`: 0.1, 1.0, 10.0; `class_weight`: None, balanced | 6 |
-| Random Forest | `max_depth`: None, 15; `min_samples_leaf`: 1, 5 | 4 |
+| Logistic Regression | `C`: 0.1, 1.0, 10.0; `class_weight`: null, balanced | 6 |
+| Random Forest | `max_depth`: null, 15; `min_samples_leaf`: 1, 5 | 4 |
 | HistGradientBoosting | `learning_rate`: 0.05, 0.1; `max_leaf_nodes`: 15, 31 | 4 |
-| Extra Trees | `max_depth`: None, 15; `min_samples_leaf`: 1, 5 | 4 |
+| Extra Trees | `max_depth`: null, 15; `min_samples_leaf`: 1, 5 | 4 |
 | **Total** | | **18** |
 
-Additional fixed settings include:
+The current `fixed` settings are:
 
-- Logistic Regression: `solver="lbfgs"`, `max_iter=5000`.
-- Random Forest: `n_estimators=150`.
-- HistGradientBoosting: `max_iter=150`.
-- Extra Trees: `n_estimators=150`.
-- Reproducibility seed: `42`.
+- Logistic Regression: `solver: lbfgs`, `max_iter: 5000`, `tol: 0.0001`.
+- Random Forest: `n_estimators: 150`, `n_jobs: -1`.
+- HistGradientBoosting: `max_iter: 150`.
+- Extra Trees: `n_estimators: 150`, `n_jobs: -1`.
+- All four families receive `random_state` from YAML `seed` (currently `42`).
 
-Logistic Regression includes an additional `StandardScaler` fitted exclusively on the training partition.
+Logistic Regression is wrapped in an additional `StandardScaler` that is fitted using training data only. This scaling is part of the classifier candidate, not a refit of the saved preprocessing transformer.
 
-The search is repeated across the three preprocessing variants:
+The default search is repeated across three preprocessing variants:
 
 | Variant | Candidates |
 |---|---:|
-| Baseline | 18 |
-| Robust | 18 |
-| Interactions | 18 |
-| **Full experiment** | **54** |
+| `baseline` | 18 |
+| `robust` | 18 |
+| `interactions` | 18 |
+| **Default full experiment** | **54** |
 
-This is a manually defined grid search, not an automated `GridSearchCV`, randomized search, or Bayesian optimization procedure.
+Candidate counts are **derived from the YAML**, not fixed in the trainer. For a model family, the number of full-mode configurations is the product of its grid-list lengths. The total candidate count is that sum multiplied by the number of selected variants. Changing these lists or `variants` will therefore change how many candidates are trained, and can change selected hyperparameters and metrics.
 
-The purpose is to compare distinct modeling approaches and validate experiment management rather than search the entire hyperparameter space.
+This is a **manually implemented exhaustive grid enumeration**, not an invocation of `GridSearchCV`, `RandomizedSearchCV`, or Optuna. An external optimizer is a possible future improvement, not an implemented feature.
 
 ### 6.3 Quick and Full Execution Modes
 
-The training module supports two execution modes.
+The training module supports two execution modes. Both load the same YAML configuration; `--quick` changes how many candidate combinations are generated.
 
 **Quick mode** is intended for development, testing, and orchestration verification:
 
@@ -927,23 +972,33 @@ The training module supports two execution modes.
 python -m src.models.train --quick
 ```
 
-It trains one configuration from each model family across all three preprocessing variants, producing 12 candidate evaluations.
+Under the current YAML, quick mode trains the **first hyperparameter combination of each of the four model families** for each of the three listed preprocessing variants: **4 × 3 = 12 candidate evaluations**. The first combination follows the order of the values in each YAML grid. Quick mode records validation results, but does not evaluate held-out test data or produce a promotable overall candidate.
 
-Quick mode records validation results but does not evaluate held-out test data or produce a promotable model candidate.
-
-**Full mode** executes the complete experiment:
+**Full mode** executes the complete Cartesian-product sweep:
 
 ```bash
 python -m src.models.train
 ```
 
-It evaluates 54 candidates, selects the best configuration within each preprocessing variant, evaluates the three winners on their corresponding test partitions, and saves the preferred candidate with its metadata.
+With the current YAML, this produces **18 × 3 = 54 candidate evaluations**, selects the best within each variant using validation metrics, evaluates each variant winner on held-out test data, and saves the preferred candidate plus its metadata. Counts change when the YAML search space changes.
 
-The completed GitHub Actions full execution successfully evaluated **54 of 54 candidates**.
+**Use an alternative training YAML file** without editing `train.py`:
+
+```bash
+python -m src.models.train --config configs/config.yml --quick
+python -m src.models.train --config configs/config.yml
+# Replace the path with your own complete, valid YAML file if needed.
+```
+
+The CLI also supports overrides for YAML defaults: `--processed-dir`, `--preprocessor-dir`, `--output-dir`, `--mlflow-db`, `--mlflow-artifacts`, and `--experiment`. When omitted, the trainer reads the corresponding settings from YAML. Relative configured paths are resolved against the repository root.
+
+**Orchestration boundary:** `scripts/run_pipeline.py` invokes the training module without its own `--config` forwarding flag, so local and GitHub Actions orchestration currently use the committed default `configs/config.yml`. To reproduce a custom experiment with an alternative YAML file, invoke `src.models.train` directly after preprocessing, or extend the orchestrator explicitly. A model-training YAML edit does not automatically rerun or modify preprocessing configuration.
+
+The previously inspected GitHub Actions full execution completed **54/54 candidates successfully** with the earlier implementation. On November 18, 2026, the YAML-driven trainer also completed a local full sweep of the default 54 candidates and again preferred `baseline` by validation F1. The complete updated local test suite subsequently passed 454 tests. These local checks do **not** replace a new post-refactor GitHub Actions verification run.
 
 ### 6.4 Validation, Model Ranking, and Decision Threshold Optimization
 
-The project uses **positive-class F1** as its primary model-selection metric.
+The project uses **positive-class F1** as its primary model-selection metric. The YAML explicitly declares `selection_metric: val_f1`; the current loader rejects other metric names, and the ranking implementation remains in Python.
 
 The positive class represents annual income greater than $50,000.
 
@@ -1013,7 +1068,7 @@ This distinction prevents test results from becoming an additional hyperparamete
 
 ### 6.5 Experimental Results
 
-The completed full experiment selected `HistGradientBoostingClassifier` as the strongest model family within all three preprocessing variants.
+The recorded experiments using the **current default hyperparameter grid** selected `HistGradientBoostingClassifier` as the strongest model family within all three preprocessing variants. The YAML-driven local full run reported the same preferred family and variant as the earlier experiment; the numeric values below are the recorded benchmark results, not guaranteed outcomes after future YAML edits.
 
 | Variant | Winning algorithm | Validation F1 | Test F1 | Test ROC-AUC |
 |---|---|---:|---:|---:|
@@ -1046,24 +1101,21 @@ These results represent the recorded performance of a limited experimental searc
 
 ### 6.6 MLflow Experiment Tracking
 
-MLflow provides experiment tracking for the training pipeline.
+MLflow provides local experiment tracking for the training pipeline. The default experiment and storage paths are configured through `configs/config.yml` and can be overridden with CLI flags.
 
 Each candidate evaluation is associated with an MLflow run containing information such as:
 
-- Model family and preprocessing variant.
-- Hyperparameter configuration.
-- Validation metrics.
-- Optimized decision threshold.
-- Experiment artifacts and diagnostic information.
-- Run identifiers and execution metadata.
+- Algorithm name, preprocessing variant, and quick/full mode.
+- Swept hyperparameters (logged with `model_` prefixes) and fixed hyperparameters (logged with `fixed_` prefixes).
+- Training seed and a hash of the candidate's training feature CSV (`data_version`).
+- **`config_sha256`: SHA-256 of the exact training YAML file used**, allowing runs to be related back to a particular configuration revision.
+- Validation metrics, default-threshold F1, and validation-optimized decision threshold.
+- Convergence warning count and a `converged` tag for eligible estimator warnings.
+- An MLflow-logged fitted sklearn estimator and related artifacts.
 
-The project uses a local SQLite tracking database:
+The trainer logs explicit model `pip_requirements` for key installed packages rather than allowing automatic package inference to scan unrelated dependencies. It also passes a narrowly defined allow-list of sklearn tree types where applicable. These settings affect **MLflow model logging**; the chosen deployable pipeline is independently packaged as a `joblib` file in the isolated execution directory.
 
-```text
-mlflow.db
-```
-
-Experiment artifacts are stored in a separately configured local artifact directory.
+The project uses a local SQLite tracking database, `mlflow.db`, and a separately configured artifact directory (`mlartifacts/` by default).
 
 To obtain the configured MLflow UI command:
 
@@ -1077,9 +1129,9 @@ Execute the printed command and open the displayed local address, commonly:
 http://127.0.0.1:5000
 ```
 
-MLflow makes it possible to inspect and compare candidate runs without relying exclusively on console output or manually maintained experiment tables.
+The UI allows candidate runs to be compared without relying exclusively on console output. **A new training execution creates new MLflow run IDs even when its YAML content is unchanged.** The YAML fingerprint helps identify matching configuration content; it does not guarantee numerically identical model artifacts across platforms or dependency versions.
 
-**Reproducibility limitation:** The local MLflow database and all historical execution artifacts are not automatically distributed with a fresh GitHub clone. Reviewers can regenerate their own experiment history by running the training pipeline.
+**Reproducibility limitation:** The local MLflow database and historical execution artifacts are not automatically distributed with a fresh GitHub clone. Reviewers can generate their own experiment history by running the trainer or shared pipeline.
 
 ### 6.7 Model Artifacts, Isolation, and Reproducibility
 
@@ -1090,7 +1142,7 @@ The generated structure is:
 ```text
 models/runs/<execution_id>/
     sweep_leaderboard.csv
-    training_summary.json
+    training_summary.json        # full mode; records config_sha256
     best_model_pipeline.joblib
     best_model_metadata.json
     baseline/
@@ -1101,9 +1153,9 @@ models/runs/<execution_id>/
 The full-execution directory contains:
 
 - **`sweep_leaderboard.csv`:** Candidate-level performance information for comparing configurations.
-- **`training_summary.json`:** Execution status, candidate counts, selected winners, and evaluation results.
+- **`training_summary.json`:** Execution status, candidate counts, successful candidate count, YAML `config_sha256`, selected winners, and evaluation results.
 - **`best_model_pipeline.joblib`:** Serialized preferred model with its fitted preprocessing pipeline.
-- **`best_model_metadata.json`:** Model configuration, decision threshold, performance, and provenance information.
+- **`best_model_metadata.json`:** Model family, preprocessing variant, decision threshold, validation performance, source execution, and artifact provenance information. The YAML hash is recorded separately in the training summary and MLflow candidate parameters; it is **not currently stored directly in candidate metadata**.
 - **Variant directories:** Additional variant-specific experiment outputs.
 
 Quick executions instead produce `quick_training_summary.json` and do not save a promotable candidate.
@@ -1133,11 +1185,12 @@ The saved metadata includes identifiers and fingerprints such as:
 - Input dataset SHA-256 hashes.
 - Fitted preprocessor SHA-256 hash.
 - Serialized model SHA-256 hash.
+- Training YAML SHA-256 in the execution summary and MLflow candidate params (not in the current candidate metadata JSON).
 - Optimized decision threshold.
 
 These values support artifact traceability and integrity verification.
 
-For the verified full GitHub Actions execution:
+For the **earlier, pre-YAML-refactor** verified full GitHub Actions execution:
 
 ```text
 Execution ID:
@@ -1159,7 +1212,7 @@ The recorded model SHA-256 is:
 f646ea469538c276b7e3a4f80e359214b6563631c3de9aceac4b67540bd98308
 ```
 
-SHA-256 verification establishes file integrity relative to the recorded fingerprint; it does not independently guarantee model correctness or bit-for-bit reproducibility across different environments.
+SHA-256 verification establishes file integrity relative to the recorded fingerprint; it does not independently guarantee model correctness or bit-for-bit reproducibility across different environments. The historical Git commit and candidate hash shown above identify the **earlier GitHub Actions execution**, not the new local YAML-driven run.
 
 **Training isolation:** Newly generated models remain in `models/runs/<execution_id>/`. The training module does not overwrite the DVC-tracked reference model.
 
@@ -1169,7 +1222,7 @@ Candidate validation and explicit promotion are described in Section 7.
 
 **The primary objective of this project was to implement a complete, reproducible MLOps pipeline rather than maximize predictive performance.**
 
-Model experimentation was deliberately limited to four algorithm families, three preprocessing variants, and 54 predefined candidates.
+Model experimentation was deliberately limited to four required algorithm families, three default preprocessing variants, and **54 candidates under the current YAML**. The candidate count and hyperparameters can now be revised in `configs/config.yml` without editing the candidate-generation Python code.
 
 This was sufficient to demonstrate training automation, hyperparameter comparison, MLflow tracking, validation-based selection, threshold optimization, held-out evaluation, artifact serialization, and explicit model promotion.
 
@@ -1177,9 +1230,9 @@ The selected model therefore represents a functional experimental baseline rathe
 
 Potential improvements include:
 
-1. **Targeted hyperparameter tuning:** Expand the search around HistGradientBoosting and the strongest preprocessing variants. Explore learning rate, tree complexity, regularization, minimum leaf size, and boosting iterations.
+1. **Targeted hyperparameter tuning:** Expand the `configs/config.yml` grid around HistGradientBoosting and the strongest preprocessing variants. Explore learning rate, tree complexity, regularization, minimum leaf size, and boosting iterations. Keep a record of each YAML revision and its SHA-256 for comparison.
 
-2. **Automated hyperparameter optimization:** Integrate Optuna, `RandomizedSearchCV`, or `GridSearchCV`. Optuna could explore larger, conditional parameter spaces using adaptive sampling and trial pruning. An exhaustive grid search would provide systematic coverage of a predefined parameter space at potentially greater computational cost.
+2. **Automated hyperparameter optimization:** Integrate Optuna, `RandomizedSearchCV`, or `GridSearchCV`. The current YAML defines grid inputs, but the trainer does **not** yet call any of those optimizers. Optuna could explore larger, conditional parameter spaces using adaptive sampling and trial pruning; exhaustive grids provide systematic coverage of a predefined space at potentially greater computational cost.
 
 3. **Expanded algorithm comparison:** Evaluate additional models such as XGBoost, LightGBM, and CatBoost, including their preprocessing requirements and computational tradeoffs.
 
@@ -1199,7 +1252,7 @@ Future experiments should retain the existing MLOps safeguards:
 - Preserve duplicate-group separation between training and validation folds.
 - Use validation or cross-validation results for model selection.
 - Keep the held-out test set outside hyperparameter and threshold optimization.
-- Record configurations, metrics, and artifacts in MLflow.
+- Record YAML configuration fingerprints, candidate settings, metrics, and artifacts in MLflow.
 - Preserve isolated execution outputs and model provenance.
 - Require explicit validation and promotion before replacing the reference model.
 
@@ -1394,7 +1447,7 @@ The promotion module updates the local reference artifacts. Versioning and publi
 
 The project uses:
 
-- **Git:** To track the DVC pointer file and associate model versions with repository revisions.
+- **Git:** To track the DVC pointer file, `configs/config.yml`, and source code, associating model versions and experimental settings with repository revisions.
 - **DVC:** To track the reference directory and identify its exact artifact contents.
 - **Amazon S3:** To store DVC-managed artifact data remotely.
 
@@ -1521,7 +1574,7 @@ The configured S3 remote supports anonymous **reads** of designated objects. Upl
 
 | Artifact | Storage/versioning policy |
 |---|---|
-| Python source, tests, README, workflows | Git |
+| Python source, tests, README, workflows, `configs/config.yml` | Git |
 | Raw Adult data | DVC + S3 |
 | Promoted `models/reference/` directory | DVC + S3; pointer in Git |
 | Per-execution training candidates | Generated locally; not automatically promoted or uploaded |
@@ -1529,7 +1582,7 @@ The configured S3 remote supports anonymous **reads** of designated objects. Upl
 | Local MLflow SQLite database/artifacts | Local; not automatically shared |
 | Drift and robustness reports | Generated locally; not automatically versioned |
 
-**DVC does not orchestrate the stages.** The Python script `scripts/run_pipeline.py` defines stage order, and GitHub Actions provides remote execution infrastructure. There is no requirement to introduce `dvc.yaml` solely to use DVC for artifact versioning.
+**DVC does not orchestrate the stages.** The Python script `scripts/run_pipeline.py` defines stage order, and GitHub Actions provides remote execution infrastructure. `configs/config.yml` is an ordinary Git-versioned training configuration, **not** a DVC `dvc.yaml` pipeline definition. There is no requirement to introduce `dvc.yaml` solely to use DVC for artifact versioning.
 
 ## 9. Data drift monitoring
 
@@ -1615,29 +1668,34 @@ These values are from the inspected JSON and CSV robustness artifacts, each cove
 
 ```bash
 # Full suite
-python -m pytest tests/ -q
+python -m pytest tests/ -q --tb=short
 
-# Individual modules
+# Focused training/configuration tests
+python -m pytest tests/test_train.py -q --tb=short
+
+# Other modules
 python -m pytest tests/test_preprocess.py -v
-python -m pytest tests/test_train.py -v
 python -m pytest tests/test_promote.py -v
 python -m pytest tests/test_monitoring.py -v
+python -m pytest tests/test_drift_generator.py -v
 python -m pytest tests/test_robustness.py -v
 ```
 
-Test coverage includes preprocessing behavior and duplicate preservation; model training and selection; candidate validation and promotion safeguards; drift monitoring; synthetic drift generation; and robustness evaluation.
+Test coverage includes preprocessing and duplicate preservation; YAML loading, validation, candidate enumeration, and propagation of custom hyperparameters into estimators; model training and selection; MLflow tracking; candidate validation and promotion safeguards; synthetic drift generation; monitoring; and robustness evaluation.
 
-The latest reported full run was:
+During the YAML refactor, **21 training tests initially failed** because the test-only mocked `candidates()` function did not accept the new `config` keyword. The fixture was corrected and three additional YAML-focused tests were added. After these changes the complete local suite reported:
 
 ```text
-451 passed, 11 warnings in 123.17s
+454 passed, 11 warnings in 140.77s (0:02:20)
 ```
 
-The warnings were deprecation notices from third-party dependencies (Evidently/NumPy, Litestar, and MLflow/SQLAlchemy). Passing tests do not prove absence of all data leakage, fairness issues, or deployment failures.
+**No test failures remain in this recorded run.** The 11 warnings are the same nonfatal third-party deprecations as before: Evidently/NumPy (2), Litestar (8), and MLflow/SQLAlchemy (1). They do not currently prevent execution, but should be monitored when upgrading dependencies.
+
+This is a **local test result on November 18, 2026**, not yet a confirmed CI result for the new YAML-refactored commit. Passing tests also do not prove the absence of every data leakage, fairness, or deployment failure.
 
 ### 11.2 Continuous integration (CI)
 
-`.github/workflows/ci.yml` handles automated code checks. A separate `retrain.yml` was intentionally removed. CI is distinct from end-to-end pipeline execution: it does not imply model deployment.
+`.github/workflows/ci.yml` handles automated code checks. A separate `retrain.yml` was intentionally removed. CI is distinct from end-to-end pipeline execution: it does not imply model deployment. After committing YAML and training-test changes, check the new CI run against the current **454-test** suite rather than relying solely on earlier successful workflow runs.
 
 ### 11.3 Shared pipeline orchestration
 
@@ -1646,12 +1704,12 @@ The warnings were deprecation notices from third-party dependencies (Evidently/N
 1. Optional explicit DVC pull (`--pull-dvc`).
 2. `python -m pytest tests/ -q`.
 3. `python -m scripts.run_preprocessing`.
-4. `python -m src.models.train --quick` or `python -m src.models.train`.
+4. `python -m src.models.train --quick` or `python -m src.models.train` (**both read `configs/config.yml` by default**).
 5. `python -m src.data.drift_generator`.
 6. `python -m src.data.monitoring`.
 7. `python -m src.models.robustness`.
 
-An unexpected stage failure stops execution. Monitoring exit code `1` is treated as an expected critical-drift alert for the deliberately severe synthetic scenario; other unexpected failures are not ignored. No stage promotes the reference model.
+An unexpected stage failure stops execution. Monitoring exit code `1` is treated as an expected critical-drift alert for the deliberately severe synthetic scenario; other unexpected failures are not ignored. No stage promotes the reference model. The training step reads the YAML file committed in the checked-out repository; **the default 12/54 counts apply only while the current grid and variant list remain unchanged**.
 
 ### 11.4 GitHub Actions orchestration
 
@@ -1665,7 +1723,7 @@ python -m scripts.run_pipeline --full
 
 The workflow uploads `reports/drift/`, `reports/robustness/`, `data/drift/drift_metadata.json`, and `models/runs/` as GitHub Actions artifacts (14-day retention). The GitHub Actions run summary records training mode, job result, reference-promotion policy, and commit. Drift details are available in logs and reports rather than a dedicated workflow summary field.
 
-**Verification status (November 2026):** The shared Python orchestrator completed a local Windows quick-mode run. The GitHub Actions orchestration workflow subsequently completed **both quick and full runs successfully** on Ubuntu. The full run trained **54/54 candidates**; its training summary and candidate metadata were inspected. Drift monitoring and reference-model robustness reports from the run were also inspected. This verifies execution of the workflow, not automatic model promotion or production deployment.
+**Verification status:** The shared Python orchestrator completed a local Windows quick-mode run. GitHub Actions subsequently completed **both quick and full runs successfully** on Ubuntu in the **earlier pre-YAML configuration revision**. That full run trained **54/54 candidates**; its training summary, metadata, drift reports, and robustness reports were inspected. The YAML-driven training command and updated tests were verified locally on November 18, 2026; rerun the GitHub Actions workflow after committing the refactor to establish equivalent remote verification. None of these operations performs automatic promotion or production deployment.
 
 ## 12. Reproducing the full workflow
 
@@ -1684,15 +1742,15 @@ python -m scripts.run_pipeline --full --pull-dvc
 python -m scripts.run_pipeline --quick
 ```
 
-`--quick` is the default training mode; `--full` runs the larger candidate search. `--pull-dvc` restores both the raw dataset and reference model. The orchestrator verifies that the reference model and metadata are present, executes tests and all ML stages, then prints a summary. A critical synthetic drift alert is expected and does not automatically fail the overall pipeline.
+`--quick` is the default training mode; `--full` runs the larger candidate search. The number of combinations comes from `configs/config.yml`, with default totals of 12 and 54. `--pull-dvc` restores both the raw dataset and reference model. The orchestrator verifies that the reference model and metadata are present, executes tests and all ML stages, then prints a summary. A critical synthetic drift alert is expected and does not automatically fail the overall pipeline. For a **custom YAML file path**, use the direct `src.models.train --config ...` command; the shared orchestrator does not currently forward `--config`.
 
-**Recorded local quick-mode result (Windows 11, November 17, 2026):** all seven stages completed; 451 tests passed with 11 dependency warnings; 12 training candidates were evaluated; the severe drift scenario produced a CRITICAL alert; robustness evaluation completed; reference promotion remained disabled. Total recorded stage duration was approximately 229 seconds.
+**Recorded earlier local quick-mode orchestration (Windows 11, November 17, 2026):** all seven stages completed; **451 tests** passed with 11 dependency warnings under that earlier test revision; 12 candidates were evaluated; the severe scenario produced a CRITICAL alert; robustness evaluation completed; and promotion stayed disabled. Total recorded stage duration was approximately 229 seconds. **Subsequent local verification (November 18):** the YAML-driven full trainer completed its 54-candidate sweep, and the updated unit/integration test suite passed **454 tests**. A new end-to-end orchestration run on that updated revision has not been reported.
 
 ### 12.2 GitHub Actions execution
 
 In the repository's **Actions** tab, select **MLOps Pipeline Orchestration**, choose **Run workflow**, select `quick` or `full`, and start the run. The workflow uses an Ubuntu 24.04 runner, explicitly restores DVC artifacts, and invokes the same Python orchestrator used locally. Download generated reports from the run's uploaded artifacts.
 
-Both **quick** and **full** GitHub Actions orchestration runs have completed successfully using the shared Python orchestrator. The full run evaluated all 54 candidates. The workflow uploads generated training, drift, and robustness artifacts for reviewer inspection; it does **not** update the DVC reference model or publish new S3 objects.
+Both **quick** and **full** GitHub Actions orchestration runs completed successfully using the shared Python orchestrator on a **previous commit**. The full run evaluated all 54 candidates. After committing the YAML refactor, rerun the workflow to confirm dependency installation and remote behavior on the new revision. The workflow uploads generated training, drift, and robustness artifacts for reviewer inspection; it does **not** update the DVC reference model or publish new S3 objects.
 
 ### 12.3 Optional candidate review and promotion
 
@@ -1721,15 +1779,15 @@ Local promotion does not require S3 write access. When publishing a new referenc
 
 ### 12.4 Reviewing execution evidence
 
-From the repository's **Actions** tab, open a successful **MLOps Pipeline Orchestration** run. Check the selected `training_mode`, job logs, and uploaded artifacts at the bottom of the run page. For a full run, inspect `models/runs/<execution_id>/training_summary.json` and `best_model_metadata.json`; compare the reported candidate counts, validation selection, and model SHA-256. Inspect `reports/drift/` for Evidently output and `reports/robustness/` for labeled stress-test results. The latest inspected full-run execution ID is `ef47ebedf90145199cba3ead91314b90`.
+From the repository's **Actions** tab, open a successful **MLOps Pipeline Orchestration** run. Check the selected `training_mode`, job logs, and uploaded artifacts at the bottom of the run page. For a full run, inspect `models/runs/<execution_id>/training_summary.json` and `best_model_metadata.json`; compare the reported candidate counts, successful candidate counts, YAML `config_sha256`, validation selection, and model SHA-256. Inspect `reports/drift/` for Evidently output and `reports/robustness/` for labeled stress-test results. The previously inspected **GitHub Actions** full-run execution ID is `ef47ebedf90145199cba3ead91314b90`. The later **local YAML-driven** full-run execution ID reported in the training log is `a10271c2dd2542f0bd6315847928d4c3`; its own summary and MLflow records should be used when documenting that execution.
 
 **Artifact policy:** GitHub Actions outputs are evidence of a specific execution and expire according to retention settings. Git/DVC pointers and the S3-backed reference model are the persistent versioning mechanism. The unpromoted candidate and the promoted reference model are intentionally different artifacts.
 
 ### Reproducibility boundaries
 
-- Fixed seeds and DVC pointers help reproduce inputs and processing but do not guarantee bit-for-bit identical models across platforms or library versions.
+- Fixed seeds, Git-versioned YAML, DVC pointers, and recorded `config_sha256` help identify inputs and settings, but do not guarantee bit-for-bit identical models across platforms or library versions.
 - MLflow run IDs and training execution IDs are generated anew on each run.
-- Full training can be substantially more expensive than quick mode.
+- Full training can be substantially more expensive than quick mode; costs and candidate counts depend on the YAML grid lengths and selected variants.
 - Local MLflow history is not automatically shared by cloning the repository.
 - The reference model is an explicitly promoted snapshot, not automatically the most recently trained candidate.
 - The orchestrator is a sequential local/CI runner, not a production deployment or distributed scheduling service.
@@ -1744,11 +1802,15 @@ From the repository's **Actions** tab, open a successful **MLOps Pipeline Orches
 | Run local orchestrator (existing DVC artifacts) | `python -m scripts.run_pipeline --quick` |
 | Generate drift scenarios | `python -m src.data.drift_generator` |
 | Check DVC status | `dvc status` |
-| Run all tests | `python -m pytest tests/ -q` |
+| Run all tests | `python -m pytest tests/ -q --tb=short` |
+| Run training/config tests | `python -m pytest tests/test_train.py -q --tb=short` |
 | Run preprocessing | `python -m scripts.run_preprocessing` |
 | Run one preprocessing variant | `python -m scripts.run_preprocessing --config baseline` |
-| Quick training | `python -m src.models.train --quick` |
-| Full training | `python -m src.models.train` |
+| Quick training using default YAML | `python -m src.models.train --quick` |
+| Full training using default YAML | `python -m src.models.train` |
+| Training with an explicit YAML path | `python -m src.models.train --config configs/config.yml` |
+| Quick training with an explicit YAML path | `python -m src.models.train --quick --config configs/config.yml` |
+| Override training output directory | `python -m src.models.train --output-dir models/custom_runs --quick` |
 | Display MLflow launch command | `python -m src.models.train --show-mlflow-command` |
 | Validate candidate | `python -m src.models.promote --run-id <ID>` |
 | Promote candidate | `python -m src.models.promote --run-id <ID> --confirm` |
@@ -1756,6 +1818,8 @@ From the repository's **Actions** tab, open a successful **MLOps Pipeline Orches
 | Evaluate robustness | See [Section 10](#10-model-robustness-under-drift) |
 | Update reference DVC pointer | `dvc add models/reference` |
 | Upload DVC objects (authorized writers) | `dvc push` |
+
+**Different meanings of `--config`:** `scripts.run_preprocessing --config baseline` selects a named Python preprocessing variant. `src.models.train --config configs/config.yml` selects a **YAML file path** for downstream model training. The current pipeline orchestrator has no `--config` argument for forwarding a custom training YAML file.
 
 ## 14. Scope, limitations, and next steps
 
@@ -1767,25 +1831,30 @@ From the repository's **Actions** tab, open a successful **MLOps Pipeline Orches
 - Manual confirmation before reference replacement.
 - DVC versioning of the promoted model **together with its metadata**.
 - Drift monitoring and labeled robustness stress tests.
-- Automated pytest coverage and existing GitHub Actions CI.
-- Shared Python pipeline orchestration, verified locally in quick mode.
-- Successful local Windows quick-mode orchestration and successful GitHub Actions quick- and full-mode orchestration using the shared Python runner.
+- Automated pytest coverage, including YAML configuration tests (**454 passed locally**), and existing GitHub Actions CI.
+- Shared Python pipeline orchestration, previously verified locally in quick mode.
+- Successful local Windows quick-mode orchestration and GitHub Actions quick/full orchestration on an earlier commit; updated YAML-driven full training and tests verified locally.
 
 ### Limitations
 
 1. **No production serving or deployment.** The project is an educational MLOps implementation, not a live prediction service.
-2. **Limited model search.** The 54-candidate sweep is deliberately constrained; it is not exhaustive optimization.
+2. **Limited model search.** The default 54-candidate sweep is deliberately constrained. The YAML permits changing grids and variants, but no adaptive hyperparameter optimization is implemented.
 3. **Synthetic drift.** Stress scenarios are controlled perturbations, not representative evidence of production drift.
 4. **Local experiment history.** MLflow tracking data and isolated run artifacts are not automatically distributed with the Git repository.
 5. **Promotion replacement is not transactionally atomic across both files.** Exception rollback is implemented, but abrupt interruption requires manual verification.
 6. **No demonstrated production fairness or external validity.** Adult Income includes demographic attributes, historical biases, and substantial domain limitations. The model must not be used for consequential decisions without separate fairness, governance, privacy, and validity assessments.
-7. **Cross-platform reproducibility is not bit-for-bit guaranteed.** Quick mode was verified locally on Windows; quick and full modes were verified on Ubuntu in GitHub Actions. Full mode has not been independently verified on every supported operating system.
+7. **Cross-platform reproducibility is not bit-for-bit guaranteed.** Earlier quick-mode orchestration was verified locally on Windows; previous quick/full pipeline runs were verified on Ubuntu in GitHub Actions. The YAML-refactored full trainer passed locally, but no new GitHub Actions result has yet been supplied for that revision.
 8. **GitHub Actions artifacts are temporary.** The configured retention period is 14 days; preserve any evidence needed beyond that window.
 9. **Explicit DVC targets are used in the tested workflow.** The cause of an earlier untargeted `dvc pull` omission of the reference directory has not been conclusively identified.
+10. **Model-family and metric flexibility is constrained.** The YAML validator currently requires the same four model families and `selection_metric: val_f1`; adding new algorithms or ranking metrics still requires code changes.
+11. **Configuration alone does not freeze the Python environment.** The trainer records the YAML fingerprint but does not persist a complete dependency lock file or guarantee that a freshly provisioned runner has every package needed for MLflow serialization.
 
 ### Remaining verification and maintenance
 
-- Preserve the successful GitHub Actions run links, training summary, drift reports, and robustness reports as submission evidence.
+- Preserve historical successful GitHub Actions run links, training summaries, drift reports, and robustness reports as submission evidence. Distinguish the pre-YAML full run from the newer local YAML-driven execution.
+- **Verify the updated YAML revision in GitHub Actions** after pushing `configs/config.yml`, `src/models/train.py`, `tests/test_train.py`, and this README; confirm its 454 tests, training outcomes, and artifact uploads.
+- **Audit `requirements.txt` for MLflow logging dependencies, especially `skops`**, in a clean environment before the next full remote run. The older archived dependency snapshot includes PyYAML but does not explicitly list skops.
+- Refresh the final technical PDF if it must describe the new YAML-configurable architecture and 454-test outcome at submission.
 - Optionally validate full-mode orchestration locally or on another operating system for additional portability evidence.
 - Investigate why an earlier untargeted `dvc pull` did not restore the reference directory, while explicit targets did.
 - Review action version deprecation notices and update individual GitHub Actions dependencies only when compatible.

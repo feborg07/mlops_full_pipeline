@@ -5,7 +5,8 @@
 > **Project status (November 2026):** Core modeling, explicit promotion, DVC/S3 storage, monitoring, robustness evaluation, automated tests, and GitHub Actions orchestration are implemented. The shared Python orchestrator has passed a local Windows quick-mode run and **both quick-mode and full-mode GitHub Actions runs**. The full remote execution completed **54/54 training candidates**. There is no production prediction API or automatic deployment.
 
 ## Contents
-
+- [Technical Report](#technical-report)
+- [Quick Start — Run the Complete Pipeline](#quick-start--run-the-complete-pipeline)
 1. [Project at a glance](#1-project-at-a-glance)
 2. [Architecture and responsibilities](#2-architecture-and-responsibilities)
 3. [Installation and reviewer quick start](#3-installation-and-reviewer-quick-start)
@@ -23,12 +24,33 @@
 
 ## Technical Report
 
-The complete project methodology, architecture,
-experimental results, drift monitoring, robustness
-evaluation, and conclusions are documented in:
+The complete project methodology, architecture, experimental results,
+drift monitoring, robustness evaluation, and conclusions are documented in:
 
-#### __[Sprint 17 — Final Technical Report](reports/Sprint_17_Final_Technical_Report.pdf)__
----
+[Read the Final Technical Report (PDF)](reports/Sprint_17_Final_Technical_Report.pdf)
+
+
+## Quick Start — Run the Complete Pipeline
+
+After cloning the repository and installing the dependencies ([installation instructions](#3-installation-and-reviewer-quick-start)), execute the complete MLOps workflow from the repository root:
+
+**Quick mode — 12 model candidates (recommended for verification):**
+
+```bash
+python -m scripts.run_pipeline --quick --pull-dvc
+```
+
+**Full mode — 54 model candidates:**
+
+```bash
+python -m scripts.run_pipeline --full --pull-dvc
+```
+
+Both commands execute automated tests, preprocessing, model training with MLflow tracking, synthetic drift generation, Evidently monitoring, and robustness evaluation. The `--pull-dvc` option retrieves the required DVC-managed datasets and reference model.
+
+**Important:** Model promotion is intentionally excluded from automated orchestration and requires explicit authorization.
+
+For detailed execution instructions, GitHub Actions orchestration, and model promotion, see [Section 12 — Reproducing the Full Workflow](#12-reproducing-the-full-workflow).
 
 ## 1. Project at a glance
 
@@ -1396,7 +1418,7 @@ dvc add models/reference
 dvc push
 
 # Commit the updated DVC pointer
-git add models/reference.dvc models/.gitignore
+git add models/reference.dvc
 git commit -m "feat: update promoted reference model"
 
 # Publish the Git revision
@@ -1596,7 +1618,7 @@ These values are from the inspected JSON and CSV robustness artifacts, each cove
 python -m pytest tests/ -q
 
 # Individual modules
-python -m pytest tests/test_preprocessing.py -v
+python -m pytest tests/test_preprocess.py -v
 python -m pytest tests/test_train.py -v
 python -m pytest tests/test_promote.py -v
 python -m pytest tests/test_monitoring.py -v
@@ -1633,7 +1655,7 @@ An unexpected stage failure stops execution. Monitoring exit code `1` is treated
 
 ### 11.4 GitHub Actions orchestration
 
-The manually dispatched `.github/workflows/orchestration_pipeline.yml` exposes a `training_mode` choice (`quick` or `full`). Its infrastructure responsibilities are repository checkout, Python 3.11 and dependency setup, explicit DVC restoration, reference artifact verification, and artifact upload. It invokes the shared orchestrator without `--pull-dvc` because the workflow has already restored DVC artifacts:
+The manually dispatched `.github/workflows/ml_pipeline_orchestration.yml` exposes a `training_mode` choice (`quick` or `full`). Its infrastructure responsibilities are repository checkout, Python 3.11 and dependency setup, explicit DVC restoration, reference artifact verification, and artifact upload. It invokes the shared orchestrator without `--pull-dvc` because the workflow has already restored DVC artifacts:
 
 ```bash
 python -m scripts.run_pipeline --quick

@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from math import prod
 from argparse import Namespace
 from pathlib import Path
 
@@ -124,7 +125,9 @@ def training_workspace(tmp_path, split_three_data):
 def fast_candidates(monkeypatch):
     """Use one inexpensive classifier per variant."""
 
-    def factory(quick=False):
+    def factory(quick=False, config=None):
+        # train() passes the loaded YAML config to candidates().
+        # Keep this test-only factory inexpensive while matching that API.
         return [
             (
                 "logistic_regression",
@@ -433,38 +436,108 @@ def test_feature_target_row_mismatch_is_rejected(
 # ============================================================
 
 def test_full_candidate_count_and_families():
-    specs = training.candidates(quick=False)
+    """The number of candidates must follow the YAML grids, not a fixed 18."""
+    config = training.load_training_config()
+    specs = training.candidates(quick=False, config=config)
 
-    assert len(specs) == 18
-    assert {family for family, _, _ in specs} == {
-        "logistic_regression",
-        "random_forest",
-        "hist_gradient_boosting",
-        "extra_trees",
-    }
+    expected = sum(
+        prod(len(values) for values in spec["grid"].values())
+        for spec in config["models"].values()
+    )
+    assert len(specs) == expected
+    assert {family for family, _, _ in specs} == set(config["models"])
 
 
 def test_quick_candidate_count():
-    assert len(training.candidates(quick=True)) == 4
+    """Quick mode selects the first YAML combination for each family."""
+    config = training.load_training_config()
+    specs = training.candidates(quick=True, config=config)
+
+    assert len(specs) == len(config["models"])
+    assert [family for family, _, _ in specs] == list(config["models"])
+    for family, params, _ in specs:
+        assert params == {
+            key: values[0]
+            for key, values in config["models"][family]["grid"].items()
+        }
 
 
 def test_logistic_regression_configuration():
+    """The generated estimator must contain the YAML fixed parameters."""
+    config = training.load_training_config()
     models = [
         model
-        for family, _, model in training.candidates(False)
+        for family, _, model in training.candidates(False, config=config)
         if family == "logistic_regression"
     ]
 
-    assert len(models) == 6
+    expected = prod(
+        len(values)
+        for values in config["models"]["logistic_regression"]["grid"].values()
+    )
+    assert len(models) == expected
 
     for model in models:
         assert isinstance(model, Pipeline)
         assert isinstance(model.steps[0][1], StandardScaler)
-        assert isinstance(
-            model.steps[-1][1],
-            LogisticRegression,
+        assert isinstance(model.steps[-1][1], LogisticRegression)
+        assert (
+            model.steps[-1][1].max_iter
+            == config["models"]["logistic_regression"]["fixed"]["max_iter"]
         )
-        assert model.steps[-1][1].max_iter == 5000
+        assert model.steps[-1][1].random_state == config["seed"]
+
+
+def test_yaml_grid_changes_generated_estimators():
+    """Changing the YAML grid must actually change estimator hyperparameters."""
+    config = copy.deepcopy(training.load_training_config())
+    config["seed"] = 77
+    config["models"]["random_forest"]["fixed"]["n_estimators"] = 7
+    config["models"]["random_forest"]["grid"] = {
+        "max_depth": [3, 7],
+        "min_samples_leaf": [2],
+    }
+    specs = training.candidates(quick=False, config=config)
+    forests = [
+        (parameters, model)
+        for family, parameters, model in specs
+        if family == "random_forest"
+    ]
+    assert len(forests) == 2
+    assert [params["max_depth"] for params, _ in forests] == [3, 7]
+    for params, estimator in forests:
+        assert estimator.max_depth == params["max_depth"]
+        assert estimator.min_samples_leaf == 2
+        assert estimator.n_estimators == 7
+        assert estimator.random_state == 77
+
+
+def test_yaml_loader_reads_supplied_file(tmp_path):
+    """The --config source can differ from the project's default YAML."""
+    import yaml
+
+    config = copy.deepcopy(training.load_training_config())
+    config["seed"] = 99
+    path = tmp_path / "custom_training.yml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    loaded = training.load_training_config(path)
+    assert loaded["seed"] == 99
+    specs = training.candidates(quick=True, config=loaded)
+    assert all(
+        (model.steps[-1][1] if isinstance(model, Pipeline) else model).random_state == 99
+        for _family, _params, model in specs
+    )
+
+
+def test_yaml_loader_rejects_invalid_selection_metric(tmp_path):
+    import yaml
+
+    config = copy.deepcopy(training.load_training_config())
+    config["selection_metric"] = "test_f1"
+    path = tmp_path / "bad_training.yml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    with pytest.raises(ValueError, match="validation F1"):
+        training.load_training_config(path)
 
 
 # ============================================================

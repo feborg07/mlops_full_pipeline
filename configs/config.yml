@@ -1,0 +1,43 @@
+# Sprint 17 — model-training configuration
+# Lists in "grid" are Cartesian products in full mode.
+# Quick mode uses the first combination from each family.
+seed: 42
+variants: [baseline, robust, interactions]
+selection_metric: val_f1
+paths:
+  processed_dir: data/processed
+  preprocessor_dir: models/preprocessors
+  output_dir: models/runs
+  mlflow_db: mlflow.db
+  mlflow_artifacts: mlartifacts
+mlflow:
+  experiment: adult-income-saved-splits
+models:
+  logistic_regression:
+    fixed:
+      max_iter: 5000
+      solver: lbfgs
+      tol: 0.0001
+    grid:
+      C: [0.1, 1.0, 10.0]
+      class_weight: [null, balanced]
+  random_forest:
+    fixed:
+      n_estimators: 150
+      n_jobs: -1
+    grid:
+      max_depth: [null, 15]
+      min_samples_leaf: [1, 5]
+  hist_gradient_boosting:
+    fixed:
+      max_iter: 150
+    grid:
+      learning_rate: [0.05, 0.1]
+      max_leaf_nodes: [15, 31]
+  extra_trees:
+    fixed:
+      n_estimators: 150
+      n_jobs: -1
+    grid:
+      max_depth: [null, 15]
+      min_samples_leaf: [1, 5]

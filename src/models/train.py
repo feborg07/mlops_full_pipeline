@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from importlib.metadata import version as package_version
 import json
 import logging
 import subprocess
@@ -53,6 +54,8 @@ from pathlib import Path
 
 import joblib
 import mlflow
+import mlflow.sklearn
+import yaml
 import numpy as np
 import pandas as pd
 
@@ -242,138 +245,77 @@ def load_variant(
 # 4. Model candidates and hyperparameters
 # ============================================================
 
-def candidates(quick: bool = False):
-    """
-    Generate model candidates.
+def load_training_config(path: Path | None = None) -> dict:
+    """Load and validate YAML settings before starting any training."""
+    path = Path(path) if path is not None else ROOT / "configs/config.yml"
+    if not path.is_file():
+        raise FileNotFoundError(f"Training YAML configuration not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ValueError("Training configuration must be a YAML mapping.")
+    required = {"seed", "variants", "selection_metric", "paths", "mlflow", "models"}
+    missing = required - config.keys()
+    if missing:
+        raise ValueError(f"Missing YAML configuration keys: {sorted(missing)}")
+    if config["selection_metric"] != "val_f1":
+        raise ValueError("Only validation F1 selection is supported.")
+    if not isinstance(config["seed"], int):
+        raise ValueError("seed must be an integer.")
+    if not isinstance(config["variants"], list) or not config["variants"]:
+        raise ValueError("variants must be a nonempty list.")
+    if not set(config["variants"]).issubset(VARIANTS):
+        raise ValueError(f"Unsupported preprocessing variant: {config['variants']}")
+    required_models = {
+        "logistic_regression", "random_forest",
+        "hist_gradient_boosting", "extra_trees",
+    }
+    if set(config["models"]) != required_models:
+        raise ValueError(f"models must contain exactly: {sorted(required_models)}")
+    for name, spec in config["models"].items():
+        if not isinstance(spec, dict) or not isinstance(spec.get("fixed"), dict):
+            raise ValueError(f"{name}: fixed must be a mapping.")
+        grid = spec.get("grid")
+        if not isinstance(grid, dict) or not grid:
+            raise ValueError(f"{name}: grid must be a nonempty mapping.")
+        if any(not isinstance(values, list) or not values for values in grid.values()):
+            raise ValueError(f"{name}: every grid entry must be a nonempty list.")
+        if set(spec["fixed"]) & set(grid):
+            raise ValueError(f"{name}: fixed and grid parameters overlap.")
+    for key in ("processed_dir", "preprocessor_dir", "output_dir",
+                "mlflow_db", "mlflow_artifacts"):
+        if not isinstance(config["paths"].get(key), str):
+            raise ValueError(f"paths.{key} must be a string.")
+    if not isinstance(config["mlflow"].get("experiment"), str):
+        raise ValueError("mlflow.experiment must be a string.")
+    return config
 
-    Full mode:
-        Logistic Regression: 6
-        Random Forest: 4
-        HistGradientBoosting: 4
-        Extra Trees: 4
 
-        Total: 18 candidates per variant.
-        Total: 54 experiments across three variants.
-
-    Quick mode:
-        One candidate per model family.
-        Total: 12 experiments.
-
-    Logistic Regression receives an additional StandardScaler
-    fitted exclusively on the training partition.
-    """
-
+def candidates(quick: bool = False, config: dict | None = None):
+    """Build sklearn candidates from the YAML Cartesian hyperparameter grids."""
+    config = load_training_config() if config is None else config
+    seed = config["seed"]
+    classes = {
+        "logistic_regression": LogisticRegression,
+        "random_forest": RandomForestClassifier,
+        "hist_gradient_boosting": HistGradientBoostingClassifier,
+        "extra_trees": ExtraTreesClassifier,
+    }
     specs = []
-
-    # Logistic Regression
-    for c, weight in product(
-        (0.1, 1.0, 10.0),
-        (None, "balanced"),
-    ):
-
-        params = {
-            "C": c,
-            "class_weight": weight,
-        }
-
-        estimator = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(
-                C=c,
-                class_weight=weight,
-                max_iter=5000,
-                solver="lbfgs",
-                tol=1e-4,
-                random_state=SEED,
-            ),
-        )
-
-        specs.append(
-            ("logistic_regression", params, estimator)
-        )
-
-    # Random Forest
-    for depth, leaf in product(
-        (None, 15),
-        (1, 5),
-    ):
-
-        params = {
-            "max_depth": depth,
-            "min_samples_leaf": leaf,
-        }
-
-        estimator = RandomForestClassifier(
-            n_estimators=150,
-            n_jobs=-1,
-            random_state=SEED,
-            **params,
-        )
-
-        specs.append(
-            ("random_forest", params, estimator)
-        )
-
-    # Histogram Gradient Boosting
-    for rate, leaves in product(
-        (0.05, 0.1),
-        (15, 31),
-    ):
-
-        params = {
-            "learning_rate": rate,
-            "max_leaf_nodes": leaves,
-        }
-
-        estimator = HistGradientBoostingClassifier(
-            max_iter=150,
-            random_state=SEED,
-            **params,
-        )
-
-        specs.append(
-            ("hist_gradient_boosting", params, estimator)
-        )
-
-    # Extra Trees
-    for depth, leaf in product(
-        (None, 15),
-        (1, 5),
-    ):
-
-        params = {
-            "max_depth": depth,
-            "min_samples_leaf": leaf,
-        }
-
-        estimator = ExtraTreesClassifier(
-            n_estimators=150,
-            n_jobs=-1,
-            random_state=SEED,
-            **params,
-        )
-
-        specs.append(
-            ("extra_trees", params, estimator)
-        )
-
-    if quick:
-
-        families = (
-            "logistic_regression",
-            "random_forest",
-            "hist_gradient_boosting",
-            "extra_trees",
-        )
-
-        return [
-            next(
-                spec for spec in specs
-                if spec[0] == family
+    for family, spec in config["models"].items():
+        grid = spec["grid"]
+        keys = list(grid)
+        combinations = product(*(grid[key] for key in keys))
+        for values in combinations:
+            params = dict(zip(keys, values))
+            estimator = classes[family](
+                **spec["fixed"], **params, random_state=seed
             )
-            for family in families
-        ]
-
+            if family == "logistic_regression":
+                estimator = make_pipeline(StandardScaler(), estimator)
+            specs.append((family, params, estimator))
+            if quick:
+                break  # One configuration per family, preserving YAML order.
     return specs
 
 
@@ -688,6 +630,8 @@ def train(args):
     Existing preprocessing artifacts are never modified.
     """
 
+    config = load_training_config(getattr(args, "config", None))
+    active_variants = config["variants"]
     processed = args.processed_dir.resolve()
     preprocessor_dir = args.preprocessor_dir.resolve()
     # Each invocation owns a unique directory, including quick runs.
@@ -713,9 +657,11 @@ def train(args):
             preprocessor_dir,
             variant,
         )
-        for variant in VARIANTS
+        for variant in active_variants
     }
 
+    # Record the exact configuration used for reproducibility.
+    config_sha256 = file_sha256(Path(getattr(args, "config", None) or ROOT / "configs/config.yml"))
     # Configure MLflow.
     configure_mlflow(
         args.experiment,
@@ -726,12 +672,12 @@ def train(args):
     leaderboard = []
     winners = {}
 
-    specifications = candidates(args.quick)
+    specifications = candidates(args.quick, config=config)
 
     LOG.info(
         "Training %s candidates across %s variants",
-        len(specifications) * len(VARIANTS),
-        len(VARIANTS),
+        len(specifications) * len(active_variants),
+        len(active_variants),
     )
 
     # --------------------------------------------------------
@@ -767,6 +713,10 @@ def train(args):
                 mlflow.log_params({
                     "variant": variant,
                     "model": family,
+                    "config_sha256": config_sha256,
+                    "data_version": file_sha256(processed / variant / "X_train.csv"),
+                    "seed": config["seed"],
+                    **{f"fixed_{k}": str(v) for k, v in config["models"][family]["fixed"].items()},
                     **{
                         f"model_{key}": str(value)
                         for key, value in params.items()
@@ -867,6 +817,31 @@ def train(args):
                     mlflow.log_metric(
                         "optimal_threshold",
                         threshold,
+                    )
+
+                    # Log models without scanning unrelated installed packages
+                    # (such as CUDA-enabled PyTorch) for dependencies.
+                    # Trust only these known sklearn tree types from our own
+                    # freshly trained models; never blindly trust external files.
+                    trusted_types = {
+                        "random_forest": ["sklearn.tree._tree.Tree"],
+                        "extra_trees": ["sklearn.tree._tree.Tree"],
+                        "hist_gradient_boosting": [
+                            "sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor"
+                        ],
+                    }.get(family, [])
+                    model_requirements = [
+                        f"{package}=={package_version(package)}"
+                        for package in (
+                            "scikit-learn", "numpy", "scipy", "pandas",
+                            "cloudpickle", "skops",
+                        )
+                    ]
+                    mlflow.sklearn.log_model(
+                        sk_model=model,
+                        name="model",
+                        skops_trusted_types=trusted_types,
+                        pip_requirements=model_requirements,
                     )
 
                     row = {
@@ -982,6 +957,7 @@ def train(args):
         "output_dir": str(output),
         "preferred_variant_by_validation": preferred,
         "quick": args.quick,
+        "config_sha256": config_sha256,
         "candidate_count": len(leaderboard),
         "successful_candidates": sum(
             row["status"] == "FINISHED"
@@ -1252,62 +1228,29 @@ def train(args):
 # ============================================================
 
 def parse_args():
-
-    parser = argparse.ArgumentParser(
-        description=__doc__
-    )
-
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--processed-dir",
-        type=Path,
-        default=ROOT / "data/processed",
+        "--config", type=Path, default=ROOT / "configs/config.yml",
+        help="YAML configuration file (default: configs/config.yml).",
     )
-
-    parser.add_argument(
-        "--preprocessor-dir",
-        type=Path,
-        default=ROOT / "models/preprocessors",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=ROOT / "models/runs",
-        help="Parent directory for unique per-execution output directories.",
-    )
-
-    parser.add_argument(
-        "--mlflow-db",
-        type=Path,
-        default=ROOT / "mlflow.db",
-    )
-
-    parser.add_argument(
-        "--mlflow-artifacts",
-        type=Path,
-        default=ROOT / "mlartifacts",
-    )
-
-    parser.add_argument(
-        "--experiment",
-        default="adult-income-saved-splits",
-    )
-
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help=(
-            "Run 4 candidates per variant "
-            "without test evaluation."
-        ),
-    )
-
-    parser.add_argument(
-        "--show-mlflow-command",
-        action="store_true",
-    )
-
-    return parser.parse_args()
+    parser.add_argument("--processed-dir", type=Path, default=None)
+    parser.add_argument("--preprocessor-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--mlflow-db", type=Path, default=None)
+    parser.add_argument("--mlflow-artifacts", type=Path, default=None)
+    parser.add_argument("--experiment", default=None)
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--show-mlflow-command", action="store_true")
+    args = parser.parse_args()
+    config = load_training_config(args.config)
+    # Resolve relative paths against repository root, not the shell's cwd.
+    for attr in ("processed_dir", "preprocessor_dir", "output_dir",
+                 "mlflow_db", "mlflow_artifacts"):
+        if getattr(args, attr) is None:
+            setattr(args, attr, ROOT / config["paths"][attr])
+    if args.experiment is None:
+        args.experiment = config["mlflow"]["experiment"]
+    return args
 
 
 # ============================================================

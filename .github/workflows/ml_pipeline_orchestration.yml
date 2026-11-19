@@ -1,11 +1,12 @@
-
+# Manual end-to-end orchestration. The automatic two-job CI workflow is ci.yml.
+# Quick training is a smoke check; only full training creates a promotable candidate.
 name: MLOps Pipeline Orchestration
 
 on:
   workflow_dispatch:
     inputs:
       training_mode:
-        description: "Training execution mode"
+        description: "Quick smoke check or full model experiment"
         required: true
         default: "quick"
         type: choice
@@ -22,7 +23,7 @@ concurrency:
 
 jobs:
   ml-pipeline:
-    name: Run ML Pipeline
+    name: Run ML Pipeline (${{ inputs.training_mode }})
     runs-on: ubuntu-24.04
     timeout-minutes: 180
 
@@ -31,74 +32,94 @@ jobs:
         shell: bash
 
     steps:
-      # 1. Retrieve repository source code.
+      # 1. Read source without persisting checkout credentials.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      # 2. Configure Python.
+      # 2. Prepare the project's pinned Python dependencies.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
 
-      # 3. Install dependencies.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
           python -m pip install "dvc[s3]==3.67.1"
 
-      # 4. Restore versioned data and reference model.
+      # 3. The shared orchestrator needs both the raw dataset and the
+      #    previously promoted reference model for robustness evaluation.
+      #    Public-read S3 downloads require no AWS credentials.
       - name: Pull DVC artifacts
         run: |
           dvc pull data/raw.dvc models/reference.dvc --verbose
 
-      # 5. Verify required reference artifacts.
-      - name: Verify reference model
+      - name: Verify DVC inputs
         run: |
-          echo "=== Reference directory ==="
-          ls -lah models/reference/
+          test -s data/raw/adult.data
+          test -s data/raw/adult.test
+          test -s models/reference/best_model_pipeline.joblib
+          test -s models/reference/best_model_metadata.json
+          echo "Raw data and promoted reference model verified."
 
-          test -f models/reference/best_model_pipeline.joblib
-          test -f models/reference/best_model_metadata.json
-
-          echo "Reference artifacts verified."
-
-      # 6. Execute the shared Python orchestrator.
-      # DVC has already been restored, so --pull-dvc
-      # is intentionally omitted.
-      - name: Run MLOps Pipeline
+      # 4. One orchestrator owns stage order: pytest, preprocessing,
+      #    training, drift generation, monitoring and robustness evaluation.
+      #    It handles the expected CRITICAL alert for synthetic severe drift.
+      #    Neither mode promotes or updates the DVC reference model.
+      - name: Run MLOps pipeline
         env:
           TRAINING_MODE: ${{ inputs.training_mode }}
         run: |
-          python -m scripts.run_pipeline --"$TRAINING_MODE"
+          python -m scripts.run_pipeline "--${TRAINING_MODE}"
 
-      # 7. Generate the GitHub Actions execution summary.
+      # 5. A complete experiment is meaningful for model comparison.
+      #    Smoke-check runs should not enter the full-model leaderboard.
+      #    MLflow uses the SQLite store populated by this job's training.
+      - name: Compare full-training experiments
+        if: ${{ inputs.training_mode == 'full' }}
+        run: |
+          python -m scripts.compare_experiments \
+            --mode full \
+            --output reports/mlflow_comparison.csv
+
+      # 6. Report the run's mode and outcome, even if a stage failed.
       - name: Write run summary
         if: always()
         env:
           TRAINING_MODE: ${{ inputs.training_mode }}
+          PIPELINE_RESULT: ${{ job.status }}
         run: |
-          echo "## Sprint 17 — MLOps Pipeline" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Training mode: $TRAINING_MODE" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Orchestration: scripts/run_pipeline.py" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Pipeline result: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Reference model promotion: disabled" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Git commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Drift results are available in the execution logs and uploaded reports." >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Sprint 17 — MLOps Pipeline"
+            echo ""
+            echo "- Training mode: $TRAINING_MODE"
+            echo "- Pipeline result: $PIPELINE_RESULT"
+            echo "- Orchestration: scripts/run_pipeline.py"
+            echo "- Git revision: $GITHUB_SHA"
+            echo "- Reference model promotion: disabled"
+            if [[ "$TRAINING_MODE" == "full" ]]; then
+              echo "- MLflow leaderboard: reports/mlflow_comparison.csv"
+            else
+              echo "- Quick training: smoke check only; no promotable candidate"
+            fi
+            echo "- Drift and robustness: reference model; see uploaded reports"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      # 8. Preserve generated reports and training artifacts.
+      # 7. Preserve per-execution artifacts. The SQLite MLflow database is
+      #    intentionally local; the CSV leaderboard is exported on full runs.
       - name: Upload pipeline artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mlops-pipeline-${{ github.run_id }}
           path: |
             reports/drift/
             reports/robustness/
+            reports/mlflow_comparison.csv
             data/drift/drift_metadata.json
             models/runs/
           if-no-files-found: warn

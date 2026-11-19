@@ -9,9 +9,10 @@ Stages:
     2. Run automated tests
     3. Preprocess datasets
     4. Train candidate models
-    5. Generate synthetic drift datasets
-    6. Monitor data drift
-    7. Evaluate reference model robustness
+    5. Compare MLflow candidates (full mode only)
+    6. Generate synthetic drift datasets
+    7. Monitor data drift
+    8. Evaluate reference model robustness
 
 Usage:
     python -m scripts.run_pipeline --quick
@@ -23,16 +24,21 @@ Notes:
     - Critical drift is expected during the severe stress test.
     - All stages run sequentially.
     - The pipeline stops when a required stage fails.
+    - Full-mode comparison uses only candidates from the current execution.
 """
 
 import argparse
+import json
 import logging
+import re
 import subprocess
 import sys
 import time
 
 from pathlib import Path
 from datetime import datetime, timezone
+
+import yaml
 
 
 # ============================================================
@@ -132,6 +138,69 @@ def run_stage(
         "exit_code": result.returncode,
         "duration_seconds": round(duration, 2),
     }
+
+
+# ============================================================
+# Full-training execution discovery
+# ============================================================
+
+def training_runs_directory() -> Path:
+    """Read the training output location from the same YAML used by train.py."""
+    config_path = PROJECT_ROOT / "configs" / "config.yml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Training config not found: {config_path}")
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+
+    if not isinstance(config, dict) or not isinstance(config.get("paths"), dict):
+        raise ValueError("Training YAML must define a 'paths' mapping.")
+
+    output_dir = config["paths"].get("output_dir")
+    if not isinstance(output_dir, str) or not output_dir.strip():
+        raise ValueError("Training YAML must define paths.output_dir.")
+
+    path = Path(output_dir)
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def execution_ids(output_dir: Path) -> set[str]:
+    """List isolated training runs; ignore unrelated folders."""
+    if not output_dir.is_dir():
+        return set()
+
+    return {
+        child.name
+        for child in output_dir.iterdir()
+        if child.is_dir() and re.fullmatch(r"[0-9a-f]{32}", child.name)
+    }
+
+
+def new_full_execution_id(output_dir: Path, previous_ids: set[str]) -> str:
+    """Identify and verify the one full run produced by this training stage."""
+    created_ids = execution_ids(output_dir) - previous_ids
+    if len(created_ids) != 1:
+        raise RuntimeError(
+            "Expected exactly one new full-training execution directory; "
+            f"found {len(created_ids)} under {output_dir}."
+        )
+
+    execution_id = created_ids.pop()
+    summary_path = output_dir / execution_id / "training_summary.json"
+    if not summary_path.is_file():
+        raise RuntimeError(f"Full-training summary missing: {summary_path}")
+
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unable to read training summary: {summary_path}") from exc
+
+    if summary.get("execution_id") != execution_id or summary.get("quick") is not False:
+        raise RuntimeError("Training summary does not match the new full execution.")
+
+    return execution_id
 
 
 # ============================================================
@@ -247,6 +316,11 @@ def run_pipeline(
 
     if training_mode == "quick":
         training_command.append("--quick")
+    else:
+        # Snapshot the YAML-configured output directory immediately before
+        # training. This is reliable even when historical runs exist.
+        runs_dir = training_runs_directory()
+        previous_ids = execution_ids(runs_dir)
 
     results.append(
         run_stage(
@@ -256,7 +330,34 @@ def run_pipeline(
     )
 
     # --------------------------------------------------------
-    # 5. Generate drift scenarios
+    # 5. Compare THIS full execution's MLflow candidates
+    # --------------------------------------------------------
+
+    if training_mode == "full":
+        execution_id = new_full_execution_id(runs_dir, previous_ids)
+        comparison_path = PROJECT_ROOT / "reports" / "mlflow_comparison.csv"
+        LOGGER.info("Full-training execution ID: %s", execution_id)
+
+        results.append(
+            run_stage(
+                "Compare MLflow experiments",
+                [
+                    python,
+                    "-m",
+                    "scripts.compare_experiments",
+                    "--mode",
+                    "full",
+                    "--execution-id",
+                    execution_id,
+                    "--output",
+                    str(comparison_path),
+                ],
+            )
+        )
+        LOGGER.info("MLflow comparison saved to: %s", comparison_path)
+
+    # --------------------------------------------------------
+    # 6. Generate drift scenarios
     # --------------------------------------------------------
 
     results.append(
@@ -271,7 +372,7 @@ def run_pipeline(
     )
 
     # --------------------------------------------------------
-    # 6. Drift monitoring
+    # 7. Drift monitoring
     # --------------------------------------------------------
 
     monitoring = run_stage(
@@ -298,7 +399,7 @@ def run_pipeline(
     results.append(monitoring)
 
     # --------------------------------------------------------
-    # 7. Reference model robustness
+    # 8. Reference model robustness
     # --------------------------------------------------------
 
     results.append(
@@ -335,6 +436,9 @@ def run_pipeline(
 
     LOGGER.info("-" * 60)
     LOGGER.info("Training mode: %s", training_mode)
+    if training_mode == "full":
+        LOGGER.info("Training execution ID: %s", execution_id)
+        LOGGER.info("MLflow comparison: %s", comparison_path)
     LOGGER.info("Drift alert: %s", monitoring["drift_alert"])
     LOGGER.info("Reference model promotion: DISABLED")
     LOGGER.info("Total stage duration: %.2fs", total_duration)

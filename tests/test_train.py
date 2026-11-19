@@ -789,9 +789,12 @@ def test_quick_training_creates_artifacts(
     )
 
     for variant in training.VARIANTS:
-        assert variant_model(run_dir, variant).is_file()
-        assert variant_threshold(run_dir, variant).is_file()
+        # A smoke check does not package deployable models or thresholds.
+        assert not variant_model(run_dir, variant).exists()
+        assert not variant_threshold(run_dir, variant).exists()
+        assert not (run_dir / variant).exists()
         assert "test" not in summary["winners"][variant]
+        assert "model_path" not in summary["winners"][variant]
 
     # Quick training does not package an overall candidate.
     assert not (run_dir / "best_model_pipeline.joblib").exists()
@@ -828,6 +831,29 @@ def test_quick_training_leaderboard(
     )
     assert (leaderboard["status"] == "FINISHED").all()
     assert leaderboard["val_f1"].notna().all()
+
+
+def test_quick_training_rejects_partial_candidate_failures(
+    training_workspace, isolated_mlflow, monkeypatch
+):
+    """The smoke check must fail if even one model configuration breaks."""
+    from sklearn.base import BaseEstimator, ClassifierMixin
+
+    class BrokenClassifier(BaseEstimator, ClassifierMixin):
+        def fit(self, X, y):
+            raise RuntimeError("intentional quick failure")
+
+    def with_failure(quick=False, config=None):
+        # Use a YAML-defined family so the test reaches the candidate fit
+        # failure handler rather than failing during MLflow parameter logging.
+        return [
+            ("random_forest", {}, BrokenClassifier()),
+            ("logistic_regression", {"C": 1.0}, LogisticRegression(max_iter=1000)),
+        ]
+
+    monkeypatch.setattr(training, "candidates", with_failure)
+    with pytest.raises(RuntimeError, match="Quick smoke check failed"):
+        run_training(training_workspace)
 
 
 # ============================================================
@@ -868,7 +894,7 @@ def test_full_training_evaluates_held_out_test(
 def test_saved_pipeline_predicts_raw_inputs(
     training_workspace, fast_candidates, isolated_mlflow
 ):
-    run_dir, _ = run_training(training_workspace)
+    run_dir, _ = run_training(training_workspace, quick=False)
     model = joblib.load(variant_model(run_dir))
 
     assert isinstance(model, Pipeline)
@@ -892,7 +918,7 @@ def test_saved_pipeline_predicts_raw_inputs(
 def test_saved_pipeline_matches_processed_predictions(
     training_workspace, fast_candidates, isolated_mlflow
 ):
-    run_dir, _ = run_training(training_workspace)
+    run_dir, _ = run_training(training_workspace, quick=False)
     model = joblib.load(variant_model(run_dir))
 
     raw = training_workspace["raw"]["test"]
@@ -917,7 +943,7 @@ def test_saved_pipeline_matches_processed_predictions(
 def test_verify_saved_model_accepts_valid_pipeline(
     training_workspace, fast_candidates, isolated_mlflow
 ):
-    run_dir, _ = run_training(training_workspace)
+    run_dir, _ = run_training(training_workspace, quick=False)
 
     model_path = variant_model(run_dir)
     threshold = json.loads(
@@ -943,7 +969,7 @@ def test_verify_saved_model_rejects_invalid_threshold(
     isolated_mlflow,
     threshold,
 ):
-    run_dir, _ = run_training(training_workspace)
+    run_dir, _ = run_training(training_workspace, quick=False)
     model_path = variant_model(run_dir)
 
     classifier = joblib.load(
@@ -965,7 +991,7 @@ def test_verify_saved_model_rejects_invalid_threshold(
 def test_verify_saved_model_detects_prediction_mismatch(
     training_workspace, fast_candidates, isolated_mlflow
 ):
-    run_dir, _ = run_training(training_workspace)
+    run_dir, _ = run_training(training_workspace, quick=False)
     model_path = variant_model(run_dir)
 
     classifier = joblib.load(
@@ -1041,6 +1067,10 @@ def test_training_logs_mlflow_runs(
     assert len(runs) == len(training.VARIANTS)
     assert "metrics.val_f1" in runs.columns
     assert runs["metrics.val_f1"].notna().all()
+    assert set(runs["tags.training_execution_id"]) == {summary["execution_id"]}
+    assert set(runs["tags.candidate_index"]) == {
+        str(index) for index in range(len(training.VARIANTS))
+    }
 
     expected_ids = {
         summary["winners"][variant]["validation"]["run_id"]

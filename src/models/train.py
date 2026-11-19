@@ -708,6 +708,11 @@ def train(args):
                     "mode": (
                         "quick" if args.quick else "full"
                     ),
+                    # Associate every candidate with its training execution.
+                    "training_execution_id": execution_id,
+                    # Preserve the candidate's original evaluation order for
+                    # deterministic tie-breaking in MLflow comparisons.
+                    "candidate_index": str(len(leaderboard)),
                 })
 
                 mlflow.log_params({
@@ -914,6 +919,17 @@ def train(args):
             data,
         )
 
+    # Quick mode is a smoke check. Any failed candidate means the check fails,
+    # even if another candidate in the same preprocessing variant succeeded.
+    if args.quick:
+        failures = [row for row in leaderboard if row["status"] != "FINISHED"]
+        if failures:
+            raise RuntimeError(
+                f"Quick smoke check failed: {len(failures)} candidate(s) failed; "
+                f"first failure: {failures[0]['variant']}/{failures[0]['model']}: "
+                f"{failures[0].get('error', 'unknown error')}"
+            )
+
     # --------------------------------------------------------
     # Save experiment leaderboard
     # --------------------------------------------------------
@@ -975,6 +991,17 @@ def train(args):
         classifier,
         data,
     ) in winners.items():
+
+        # Quick mode is a smoke check only: training, validation and MLflow
+        # logging have already succeeded. Do not package any deployable
+        # pipeline or threshold, and never touch held-out test data.
+        if args.quick:
+            summary["winners"][variant] = {"validation": best}
+            LOG.info(
+                "Quick check %s: %s, validation F1=%.4f",
+                variant, best["model"], best["val_f1"],
+            )
+            continue
 
         variant_dir = output / variant
 

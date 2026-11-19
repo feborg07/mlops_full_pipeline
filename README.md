@@ -2,7 +2,7 @@
 
 **Reproducible machine learning workflow for the UCI Adult Income classification dataset.** This educational project focuses on the *lifecycle* of a model—not merely fitting a classifier—including versioned data, reproducible preprocessing, experiment tracking, isolated training executions, explicit model promotion, drift detection, robustness evaluation, and automated tests.
 
-> **Project status (November 18–19, 2026):** The Sprint 17 rubric components are implemented: Git/DVC versioning, YAML-driven training, MLflow model logging and programmatic experiment comparison, real-data and model validation tests, two-job GitHub Actions CI, Evidently monitoring, and a written drift analysis. The latest **local full orchestration** passed **476 tests (11 third-party warnings)**, evaluated **54 candidates**, compared precisely those 54 MLflow runs, and completed drift and robustness evaluation. The updated automatic **GitHub Actions CI passed**, as reported by the repository owner. Earlier manual GitHub Actions quick/full orchestration runs succeeded, but the newest execution-ID-filtered orchestrator has been verified **locally**, not yet confirmed in a fresh remote full run. Reference-model promotion remains manual; there is no production prediction API or automatic deployment.
+> **Project status (November 18–19, 2026):** The Sprint 17 rubric components are implemented: Git/DVC versioning, YAML-driven training, MLflow model logging and programmatic experiment comparison, real-data and model validation tests, two-job GitHub Actions CI, Evidently monitoring, and a written drift analysis. The latest **local full orchestration** passed **476 tests (11 third-party warnings)**, evaluated **54 candidates**, compared precisely those 54 MLflow runs, and completed drift and robustness evaluation. The updated automatic **GitHub Actions CI passed**. Earlier manual GitHub Actions quick/full orchestration runs succeeded. Reference-model promotion remains manual; there is no production prediction API or automatic deployment.
 
 ## Contents
 - [Quick Start — Run the Complete Pipeline](#quick-start--run-the-complete-pipeline)
@@ -63,8 +63,8 @@ For detailed execution instructions, GitHub Actions orchestration, and model pro
 | Selected validation F1 | 0.7337 |
 | Selected held-out test F1 | 0.7150 |
 | Latest local test run | **476 passed, 11 third-party warnings** (November 18, 2026, local time) |
-| Automatic GitHub Actions CI | **Passed**, per latest owner report; two dependent jobs with minimum validation F1 = 0.65 |
-| Manual GitHub Actions orchestration | Earlier quick/full runs successful; latest orchestrator changes still require fresh remote verification |
+| Automatic GitHub Actions CI | **Passed** two dependent jobs with minimum validation F1 = 0.65 |
+| Manual GitHub Actions orchestration | **Passed** quick/full runs successful |
 | Verified full-run candidates | **54 / 54** in the latest locally completed full orchestration |
 | Latest local full orchestration | `21ed6abc583e4bee87433acd8f9517da` — training and MLflow comparison both selected `baseline` |
 
@@ -89,7 +89,7 @@ For detailed execution instructions, GitHub Actions orchestration, and model pro
 | Robustness evaluation under drift | Implemented |
 | GitHub Actions **CI** (`ci.yml`: test → train; F1 gate ≥ 0.65) | Implemented; recent CI success reported |
 | Shared Python orchestration (`scripts/run_pipeline.py`) | Latest full mode verified locally, including MLflow comparison |
-| Manual GitHub Actions orchestration | Earlier quick/full runs successful; YAML comparison step needs synchronization with orchestrator |
+| Manual GitHub Actions orchestration | Implemented |
 | Full-mode candidate sweep | Latest local orchestration completed 54/54, selecting `baseline` |
 | GitHub Actions evaluation artifacts | Training, drift, and robustness reports inspected |
 | Production model-serving endpoint / automatic deployment | Out of scope |
@@ -681,9 +681,8 @@ The pipeline supports:
 
 The logarithmic transformation is defined as:
 
-\[
-x_{\text{log}}=\ln(1+x)
-\]
+$x_{\text{log}} = \ln(1+x)$
+
 
 This transformation preserves zero values while compressing the scale of positive values.
 
@@ -1005,9 +1004,7 @@ The positive class represents annual income greater than $50,000.
 
 F1 combines precision and recall:
 
-\[
-F_1 = 2 \times \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}
-\]
+$F_1 = 2 \times \frac{\text{Precision} \times \text{Recall}}{\text{Precision} + \text{Recall}}$
 
 F1 was selected because the target is imbalanced, with approximately 24% positive observations, and accuracy alone can obscure poor positive-class detection.
 

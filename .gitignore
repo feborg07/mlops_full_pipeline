@@ -106,12 +106,10 @@ desktop.ini
 # ------------------------------------------------------------
 # 10. Generated reports and figures
 # ------------------------------------------------------------
+/reports/*
 /reports/figures/
 /reports/drift/
 /reports/robustness/
-
-# The final technical report remains trackable:
-# reports/Sprint_17_Final_Technical_Report.pdf
 
 # ------------------------------------------------------------
 # 11. Testing and coverage artifacts

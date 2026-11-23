@@ -387,10 +387,40 @@ def extract_drift_metrics(
             "with the monitored feature count."
         )
 
+    # Extract per-feature drift decisions from Evidently 0.7.x.
+    feature_scores = {}
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        config = metric.get("config")
+        if not isinstance(config, dict) or config.get("type") != "evidently:metric_v2:ValueDrift":
+            continue
+        column = config.get("column")
+        if column not in FEATURE_COLUMNS or column in feature_scores:
+            raise ValueError(f"Invalid or duplicate ValueDrift column: {column}")
+        threshold = config.get("threshold")
+        score = metric.get("value")
+        if not isinstance(threshold, (int, float)) or not isinstance(score, (int, float)):
+            raise ValueError(f"Invalid ValueDrift score or threshold for {column}")
+        if not 0 <= score <= 1 or not 0 < threshold < 1:
+            raise ValueError(f"Out-of-range ValueDrift score or threshold for {column}")
+        feature_scores[column] = (float(score), float(threshold))
+
+    if set(feature_scores) != set(FEATURE_COLUMNS):
+        raise ValueError("Missing ValueDrift metrics for monitored features.")
+
+    drifted_names = [
+        column for column in FEATURE_COLUMNS
+        if feature_scores[column][0] > feature_scores[column][1]
+    ]
+    if len(drifted_names) != count:
+        raise ValueError("Per-feature drift decisions disagree with DriftedColumnsCount.")
+
     return {
         "total_features": expected_features,
         "drifted_features": count,
         "drift_share": share,
+        "drifted_feature_names": drifted_names,
     }
 
 
@@ -511,6 +541,12 @@ def run_drift_analysis(
         statistics["total_features"],
         statistics["drift_share"] * 100,
         status.upper(),
+    )
+
+    LOGGER.info(
+        "%s drifted feature names: %s",
+        scenario.upper(),
+        ", ".join(statistics["drifted_feature_names"]) or "None",
     )
 
     return summary
@@ -690,6 +726,10 @@ def main(
                 f"{result['total_features']:2d} features | "
                 f"{result['drift_share']:.2%} | "
                 f"{result['status'].upper()}"
+            )
+            print(
+                "  Drifted features: "
+                + (", ".join(result["drifted_feature_names"]) or "None")
             )
 
         print("-" * 55)

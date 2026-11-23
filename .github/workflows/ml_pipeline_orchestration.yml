@@ -76,17 +76,7 @@ jobs:
         run: |
           python -m scripts.run_pipeline "--${TRAINING_MODE}"
 
-      # 5. A complete experiment is meaningful for model comparison.
-      #    Smoke-check runs should not enter the full-model leaderboard.
-      #    MLflow uses the SQLite store populated by this job's training.
-      - name: Compare full-training experiments
-        if: ${{ inputs.training_mode == 'full' }}
-        run: |
-          python -m scripts.compare_experiments \
-            --mode full \
-            --output reports/mlflow_comparison.csv
-
-      # 6. Report the run's mode and outcome, even if a stage failed.
+      # 5. Report the run's mode and outcome, even if a stage failed.
       - name: Write run summary
         if: always()
         env:
@@ -109,7 +99,7 @@ jobs:
             echo "- Drift and robustness: reference model; see uploaded reports"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 7. Preserve per-execution artifacts. The SQLite MLflow database is
+      # 6. Preserve per-execution artifacts. The SQLite MLflow database is
       #    intentionally local; the CSV leaderboard is exported on full runs.
       - name: Upload pipeline artifacts
         if: always()

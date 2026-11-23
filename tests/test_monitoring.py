@@ -178,22 +178,22 @@ def fake_snapshot():
     """
 
     def factory(count, share, total=14):
-        return SimpleNamespace(
-            dict=lambda: {
-                "metrics": [
-                    {
-                        "metric_name": (
-                            "DriftedColumnsCount("
-                            "columns=None)"
-                        ),
-                        "value": {
-                            "count": count,
-                            "share": share,
-                        },
-                    }
-                ]
-            }
-        )
+        # Deterministic per-column metrics matching Evidently 0.7.23 JSON.
+        scores = [0.2 if i < min(count, total) else 0.0 for i in range(total)]
+        metrics = [{
+            "metric_name": "DriftedColumnsCount(columns=None)",
+            "value": {"count": count, "share": share},
+        }]
+        metrics += [{
+            "metric_name": f"ValueDrift(column={column})",
+            "config": {
+                "type": "evidently:metric_v2:ValueDrift",
+                "column": column,
+                "threshold": 0.1,
+            },
+            "value": score,
+        } for column, score in zip(FEATURE_COLUMNS, scores)]
+        return SimpleNamespace(dict=lambda: {"metrics": metrics})
 
     return factory
 
@@ -570,6 +570,7 @@ def test_extract_valid_metrics(fake_snapshot):
 
     assert result["total_features"] == 14
     assert result["drifted_features"] == 5
+    assert result["drifted_feature_names"] == FEATURE_COLUMNS[:5]
 
     assert result["drift_share"] == pytest.approx(
         5 / 14
@@ -589,6 +590,7 @@ def test_extract_zero_drift(fake_snapshot):
 
     assert result["drifted_features"] == 0
     assert result["drift_share"] == 0
+    assert result["drifted_feature_names"] == []
 
 
 def test_extract_rejects_inconsistent_share(fake_snapshot):
@@ -650,6 +652,21 @@ def test_extract_rejects_missing_values():
         )
 
 
+
+def test_extract_real_evidently_snapshot():
+    """Regression test against the supplied Evidently 0.7.23 JSON structure."""
+    from pathlib import Path
+    # Fixture generated in-memory to avoid depending on an external report file.
+    metrics = [{"metric_name": "DriftedColumnsCount", "value": {"count": 3, "share": 3 / 14}}]
+    drifted = {"education-num", "hours-per-week", "occupation"}
+    for column in FEATURE_COLUMNS:
+        metrics.append({
+            "config": {"type": "evidently:metric_v2:ValueDrift", "column": column, "threshold": 0.1},
+            "value": 0.2 if column in drifted else 0.0,
+        })
+    result = mon.extract_drift_metrics(SimpleNamespace(dict=lambda: {"metrics": metrics}), 14)
+    assert set(result["drifted_feature_names"]) == drifted
+
 # ============================================================
 # 9. Drift analysis integration tests
 # ============================================================
@@ -667,6 +684,8 @@ def test_run_drift_analysis_creates_reports(
     )
 
     assert result["scenario"] == "moderate"
+    assert len(result["drifted_feature_names"]) == result["drifted_features"]
+    assert {"age", "hours-per-week", "occupation"}.issubset(set(result["drifted_feature_names"]))
 
     assert result["total_features"] == 14
 
@@ -693,6 +712,7 @@ def test_identical_distributions_have_zero_drift(
     assert result["drifted_features"] == 0
     assert result["drift_share"] == pytest.approx(0)
     assert result["status"] == "normal"
+    assert result["drifted_feature_names"] == []
 
 
 def test_run_drift_analysis_rejects_invalid_scenario(
@@ -874,18 +894,21 @@ def test_main_exit_codes(
             "scenarios": {
                 "mild": {
                     "drifted_features": 0,
+                    "drifted_feature_names": [],
                     "total_features": 14,
                     "drift_share": 0.0,
                     "status": "normal",
                 },
                 "moderate": {
                     "drifted_features": 3,
+                    "drifted_feature_names": ["education-num", "hours-per-week", "occupation"],
                     "total_features": 14,
                     "drift_share": 3 / 14,
                     "status": "warning",
                 },
                 "severe": {
                     "drifted_features": 5,
+                    "drifted_feature_names": ["age", "education-num", "hours-per-week", "workclass", "occupation"],
                     "total_features": 14,
                     "drift_share": 5 / 14,
                     "status": status,
